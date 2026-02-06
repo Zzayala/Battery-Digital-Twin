@@ -1,0 +1,18 @@
+{
+    "packs": {
+        "14S1P_100-0": {
+            "modelo_celda": "Generico 10Ah",
+            "ns": 14,
+            "np": 1,
+            "soc_max": 100,
+            "soc_min": 0
+        },
+        "14S2P100-0": {
+            "modelo_celda": "Generico 5Ah",
+            "ns": 14,
+            "np": 2,
+            "soc_max": 100,
+            "soc_min": 0
+        }
+    }
+}

@@ -1,0 +1,21 @@
+# =============================================================================
+# Batería Lab - Dependencias del Proyecto
+# =============================================================================
+# Instalar con: pip install -r requirements.txt
+# =============================================================================
+
+# --- Framework Web ---
+streamlit>=1.28.0
+
+# --- Cálculo Numérico ---
+numpy>=1.24.0
+scipy>=1.10.0
+
+# --- Visualización ---
+matplotlib>=3.7.0
+
+# --- Manejo de Datos ---
+pandas>=2.0.0
+
+# --- Opcional: Aceleración (descomentar si se usa Numba) ---
+# numba>=0.57.0

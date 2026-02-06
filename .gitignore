@@ -1,0 +1,28 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data directories (excluding specific config/metadata files if needed, but keeping json as requested)
+# Assuming we want to track JSON configs but maybe not large raw data if it exceeds GitHub limits
+# For now, I'll track everything unless specified otherwise.
+# If files > 100MB, we should exclude them or use LFS.
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# VS Code History
+.history/

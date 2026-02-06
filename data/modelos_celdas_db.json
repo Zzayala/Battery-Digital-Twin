@@ -1,0 +1,27 @@
+{
+    "last_used": "Generico 10Ah",
+    "models": {
+        "Generico 10Ah": {
+            "cap": 10.0,
+            "v_nom": 3.7,
+            "v_max": 4.2,
+            "v_min": 2.5,
+            "peso": 200.0,
+            "r_int": 1.5,
+            "i_cont": 80.0,
+            "i_pico": 300.0,
+            "t_pico": 3.0
+        },
+        "Generico 5Ah": {
+            "cap": 5.0,
+            "v_nom": 3.7,
+            "v_max": 4.2,
+            "v_min": 2.5,
+            "peso": 100.0,
+            "r_int": 1.5,
+            "i_cont": 40.0,
+            "i_pico": 150.0,
+            "t_pico": 3.0
+        }
+    }
+}
