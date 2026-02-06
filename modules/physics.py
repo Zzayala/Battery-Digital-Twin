@@ -450,17 +450,18 @@ def obtener_funcion_ocv_polinomica(v_min, v_nom, v_max):
     
     def f_ocv_base(soc):
         # Polinomio base (aprox 2.75V a 4.2V)
+        # Implementación de Horner's method para mayor eficiencia y estabilidad numérica
         soc = np.clip(soc, 0, 100)
-        ocv = (2.17851508e-15 * soc**9 
-              - 1.06187295e-12 * soc**8 
-              + 2.19502650e-10 * soc**7 
-              - 2.50522387e-08 * soc**6 
-              + 1.72171213e-06 * soc**5 
-              - 7.29079506e-05 * soc**4 
-              + 1.87251524e-03 * soc**3 
-              - 2.77050498e-02 * soc**2 
-              + 2.18531709e-01 * soc 
-              + 2.75626590e+00)
+        ocv = (2.75626590e+00 + soc * (
+              2.18531709e-01 + soc * (
+              -2.77050498e-02 + soc * (
+              1.87251524e-03 + soc * (
+              -7.29079506e-05 + soc * (
+              1.72171213e-06 + soc * (
+              -2.50522387e-08 + soc * (
+              2.19502650e-10 + soc * (
+              -1.06187295e-12 + soc *
+              2.17851508e-15)))))))))
         return ocv
 
     # Calibración dinámica: Adaptar curva base a límites v_min y v_max
