@@ -67,6 +67,30 @@ def save_benchmark_result(circuit_name, pack_label, t_data, temp_data, metadata)
 
 
 
+def _validate_benchmark_path(circuit_name, filename=None):
+    """
+    Valida que la ruta del archivo esté dentro del directorio de benchmarks.
+    Retorna la ruta absoluta si es válida, o None si no lo es.
+    """
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    base_dir = os.path.abspath(os.path.join(root_dir, 'data', 'benchmark'))
+
+    if filename:
+        target_path = os.path.abspath(os.path.join(base_dir, circuit_name, filename))
+    else:
+        target_path = os.path.abspath(os.path.join(base_dir, circuit_name))
+
+    # Check that target_path starts with base_dir using commonpath
+    try:
+        if os.path.commonpath([base_dir, target_path]) == base_dir:
+            return target_path
+    except ValueError:
+        # Can happen if paths are on different drives
+        return None
+
+    return None
+
+
 def list_benchmark_circuits():
     """Devuelve lista de carpetas de circuitos con benchmarks."""
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -77,17 +101,18 @@ def list_benchmark_circuits():
 
 def list_benchmark_files(circuit_name):
     """Devuelve lista de archivos CSV en la carpeta del circuito."""
-    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    target_dir = os.path.join(root_dir, 'data', 'benchmark', circuit_name)
-    if not os.path.exists(target_dir):
+    target_dir = _validate_benchmark_path(circuit_name)
+    if not target_dir or not os.path.exists(target_dir):
         return []
     return [f for f in os.listdir(target_dir) if f.endswith('.csv')]
 
 def load_benchmark_file(circuit_name, filename):
     """Carga CSV de benchmark y extrae datos + metadata."""
-    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    path = os.path.join(root_dir, 'data', 'benchmark', circuit_name, filename)
+    path = _validate_benchmark_path(circuit_name, filename)
     
+    if not path:
+        return None, None, {'Error': 'Ruta de archivo inválida'}
+
     t_data = []
     temp_data = []
     metadata = {}
@@ -127,8 +152,10 @@ def load_benchmark_file(circuit_name, filename):
 
 def delete_benchmark_file(circuit_name, filename):
     """Borra un archivo de benchmark."""
-    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    path = os.path.join(root_dir, 'data', 'benchmark', circuit_name, filename)
+    path = _validate_benchmark_path(circuit_name, filename)
+    if not path:
+        return False, "Ruta de archivo inválida o intento de acceso no autorizado"
+
     try:
         if os.path.exists(path):
             os.remove(path)
