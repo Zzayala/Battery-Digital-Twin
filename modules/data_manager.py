@@ -15,7 +15,7 @@ import streamlit as st
 import json
 import os
 import numpy as np
-
+import pandas as pd
 from .utils import get_data_path
 
 
@@ -372,39 +372,53 @@ def cargar_potencia_base(filename="potencia_base.txt"):
         return None, None, 0.0, 0.0
     
     try:
-        t_out, p_out = [], []
-        suma_pot_dur = 0.0
-        suma_i_dur = 0.0
-        suma_dur = 0.0
+        # Load data using pandas
+        # errors='ignore' in open() maps to encoding_errors='ignore'
+        df = pd.read_csv(full_path, on_bad_lines='skip', encoding='utf-8', encoding_errors='ignore')
         
-        with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()
+        required_cols = ['t_inicio_s', 't_fin_s', 'duracion_s', 'corriente_total_A', 'potencia_total_W']
         
-        for line in lines[1:]:  # Skip header
-            parts = line.strip().split(',')
-            if len(parts) >= 5:
-                try:
-                    t_inicio = float(parts[0])
-                    t_fin = float(parts[1])
-                    duracion = float(parts[2])
-                    corriente_a = float(parts[3])
-                    potencia_w = float(parts[4])
-                    
-                    suma_pot_dur += potencia_w * duracion
-                    suma_i_dur += corriente_a * duracion
-                    suma_dur += duracion
-                    
-                    steps = max(1, int((t_fin - t_inicio) * 10))
-                    t_out.extend(np.linspace(t_inicio, t_fin, steps, endpoint=False))
-                    p_out.extend(np.full(steps, potencia_w))
-                except:
-                    continue
+        # Check if required columns are present
+        if not all(col in df.columns for col in required_cols):
+            return None, None, 0.0, 0.0
+            
+        # Convert to numeric and drop invalid rows (mimicking try-except float conversion)
+        for col in required_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+        df.dropna(subset=required_cols, inplace=True)
         
-        p_media_w = suma_pot_dur / suma_dur if suma_dur > 0 else 0.0
-        i_media_a = suma_i_dur / suma_dur if suma_dur > 0 else 0.0
+        if df.empty:
+            return np.array([]), np.array([]), 0.0, 0.0
+
+        durations = df['duracion_s']
+        suma_dur = durations.sum()
         
-        return np.array(t_out), np.array(p_out), p_media_w, i_media_a
-    except:
+        if suma_dur > 0:
+            p_media_w = (df['potencia_total_W'] * durations).sum() / suma_dur
+            i_media_a = (df['corriente_total_A'] * durations).sum() / suma_dur
+        else:
+            p_media_w = 0.0
+            i_media_a = 0.0
+            
+        # Generate t_out and p_out
+        # Vectorized steps calculation
+        steps = np.maximum(1, ((df['t_fin_s'] - df['t_inicio_s']) * 10).astype(int))
+        
+        # Repeat power values
+        p_out = np.repeat(df['potencia_total_W'].values, steps)
+        
+        # Generate time values
+        t_list = [np.linspace(start, end, n, endpoint=False) 
+                  for start, end, n in zip(df['t_inicio_s'], df['t_fin_s'], steps)]
+        
+        if t_list:
+            t_out = np.concatenate(t_list)
+        else:
+            t_out = np.array([])
+            
+        return t_out, p_out, p_media_w, i_media_a
+    except Exception:
         return None, None, 0.0, 0.0
 
 
