@@ -15,6 +15,7 @@ import streamlit as st
 import json
 import os
 import numpy as np
+import pandas as pd
 
 from .utils import get_data_path
 
@@ -319,36 +320,35 @@ def cargar_telemetria_csv(circuito_name):
     path = get_data_path(mapa_archivos[circuito_name], "telemetria")
     
     try:
-        times, speeds, accels = [], [], []
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()
-            
-        for line in lines[1:]:  # Skip header
-            parts = line.split(';')
-            if len(parts) >= 3:
-                try:
-                    v_str = parts[0].replace(',', '.').strip()
-                    t_str = parts[1].replace(',', '.').strip()
-                    a_str = parts[2].replace(',', '.').strip()
-                    
-                    v_val = float(v_str)
-                    t_val = float(t_str)
-                    a_val = float(a_str)
-                    
-                    if np.isnan(v_val) or np.isnan(t_val) or np.isnan(a_val):
-                        continue
-                    
-                    times.append(t_val)
-                    speeds.append(v_val)
-                    accels.append(a_val)
-                except:
-                    continue
+        # Optimized with pandas for faster parsing
+        df = pd.read_csv(
+            path,
+            sep=';',
+            decimal=',',
+            encoding='utf-8',
+            on_bad_lines='skip',
+            dtype=np.float64
+        )
+
+        # Ensure we have at least 3 columns
+        if len(df.columns) < 3:
+            return None, None, None
+
+        # Select only the first 3 columns (Speed, Time, Accel)
+        df = df.iloc[:, :3]
+
+        # Rename columns to standard names
+        df.columns = ['v', 't', 'a']
+
+        # Drop rows with NaN in these columns
+        df = df.dropna()
+
+        # Sort by Time
+        df = df.sort_values(by='t')
         
-        # Ordenar por tiempo
-        arr = sorted(zip(times, speeds, accels))
-        t_out = np.array([x[0] for x in arr])
-        v_out = np.array([x[1] for x in arr])
-        a_out = np.array([x[2] for x in arr])
+        t_out = df['t'].to_numpy()
+        v_out = df['v'].to_numpy()
+        a_out = df['a'].to_numpy()
         
         return t_out, v_out, a_out
     except Exception as e:
