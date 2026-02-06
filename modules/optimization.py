@@ -10,7 +10,7 @@ Funciones:
 
 import numpy as np
 
-from .physics import calcular_soc_final_para_umbral
+from .physics import calcular_soc_final_para_umbral, obtener_funcion_ocv_polinomica
 
 
 # =============================================================================
@@ -47,6 +47,15 @@ def buscar_umbral_optimo(soc_minimo, acc_telem, v_ms, n_vueltas, params):
     soc_target_min = soc_minimo
     soc_target_max = soc_minimo + 2.0
     
+    # Pre-calcular polinomio OCV para evitar repetición en bucle (Optimización)
+    if 'f_ocv' not in params:
+        f_ocv = obtener_funcion_ocv_polinomica(
+            params['v_min_celda'],
+            params['v_nom_celda'],
+            params['v_max_celda']
+        )
+        params['f_ocv'] = f_ocv
+
     # Log para debug
     log_pruebas = []
     

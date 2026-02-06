@@ -630,7 +630,8 @@ def calcular_soc_final_para_umbral(
     dt,
     margen_traccion=0.90,
     activar_limite_motor=False,
-    p_motor_max_kw=0.0
+    p_motor_max_kw=0.0,
+    f_ocv=None
 ):
     """
     Calcula el SOC final simulando con la curva OCV real.
@@ -643,7 +644,8 @@ def calcular_soc_final_para_umbral(
         float: SOC final después de n_vueltas (%)
     """
     # 1. Generar polinomio OCV
-    f_ocv = obtener_funcion_ocv_polinomica(v_min_celda, v_nom_celda, v_max_celda)
+    if f_ocv is None:
+        f_ocv = obtener_funcion_ocv_polinomica(v_min_celda, v_nom_celda, v_max_celda)
     
     # 2. Generar perfil de potencia del pack (W)
     P_elec_pack = generar_perfil_potencia_unificado(
