@@ -61,10 +61,11 @@ aplicar_estilos_globales()
 inicializar_session_state()
 
 # Recuparación preventiva de estado antes de pintar widgets (para Auto-Ajuste)
-if st.session_state.get('auto_ajuste_pendiente', False):
-    snap_recov = st.session_state.get('snapshot_inputs', {})
-    if 'p_motor_max_kw' in snap_recov:
-         st.session_state.p_motor_max_kw = snap_recov['p_motor_max_kw']
+# ELIMINADO: Lógica de snapshot antigua que causaba conflictos con inputs del usuario.
+# if st.session_state.get('auto_ajuste_pendiente', False):
+#     snap_recov = st.session_state.get('snapshot_inputs', {})
+#     if 'p_motor_max_kw' in snap_recov:
+#          st.session_state.p_motor_max_kw = snap_recov['p_motor_max_kw']
 
 # Constantes rápidas
 CV = CONSTANTES_VEHICULO
