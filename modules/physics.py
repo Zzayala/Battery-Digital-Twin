@@ -21,6 +21,55 @@ except ImportError:
 # =============================================================================
 
 @jit(nopython=True)
+def _calcular_resistencia_dinamica(r_base_ohm, soc, temp_c, current_a, t_pulso_s):
+    """
+    Calcula la resistencia instantánea dinámica.
+    
+    Factores:
+    - SOC: "Bañera" (sube en <10% y >90%)
+    - Temp: Arrhenius (baja con T)
+    - Corriente: Butler-Volmer (baja con I)
+    - Tiempo: Polarización (sube con t_pulso)
+    """
+    # Evitar errores numéricos
+    if r_base_ohm < 1e-9: return 0.0
+    
+    # --- 1. TÉRMINO BASE (SOC) ---
+    factor_soc = 1.0
+    if soc < 10.0:
+        val = (10.0 - soc) / 10.0
+        factor_soc = 1.0 + 0.5 * (val * val)
+    elif soc > 90.0:
+        val = (soc - 90.0) / 10.0
+        factor_soc = 1.0 + 0.2 * (val * val)
+        
+    R_soc = r_base_ohm * factor_soc
+
+    # --- 2. TÉRMINO ARRHENIUS (TEMPERATURA) ---
+    # T_ref = 298.15 K (25°C)
+    # Ea_R ~ 1500.0 K
+    temp_k = temp_c + 273.15
+    # Clamp temp para evitar div/0 o valores locos
+    if temp_k < 200: temp_k = 200.0
+    
+    factor_arrhenius = np.exp(1500.0 * (1.0/temp_k - 1.0/298.15))
+
+    # --- 3. TÉRMINO BUTLER-VOLMER (CORRIENTE) ---
+    # k1=0.15, k2=0.05
+    i_abs = abs(current_a)
+    factor_corriente = 1.0 - 0.15 * (1.0 - np.exp(-0.05 * i_abs))
+
+    # --- 4. TÉRMINO DINÁMICO (TIEMPO) ---
+    # tau=5.0s, k_pol=0.3
+    # Mantenemos el t_pulso controlado
+    factor_tiempo = 1.0 + 0.3 * (1.0 - np.exp(-t_pulso_s / 5.0))
+
+    # --- FINAL ---
+    R_total = R_soc * factor_arrhenius * factor_corriente * factor_tiempo
+    
+    return R_total
+
+@jit(nopython=True)
 def _simular_soc_numba(
     P_elec_pack, 
     dt, 
@@ -833,7 +882,9 @@ def simular_con_umbral_adaptativo(
     temps_full = np.zeros(n_puntos_total)
     umbral_full = np.zeros(n_puntos_total)
     P_elec_full = np.zeros(n_puntos_total)
+    P_elec_full = np.zeros(n_puntos_total)
     distancia_full = np.zeros(n_puntos_total)
+    r_pack_full = np.zeros(n_puntos_total)
     
     # Estado inicial
     soc_actual = soc_max
@@ -848,7 +899,11 @@ def simular_con_umbral_adaptativo(
     mass_celda_kg = peso_celda_g / 1000.0
     mass_pack_kg = mass_celda_kg * n_celdas_total
     cp = 1000  # J/(kg·K) - Calor específico de celdas LiPo
-    r_operative_cell = (r_interna_mohm / 1000.0)
+    r_operative_cell_base = (r_interna_mohm / 1000.0)
+    
+    # Variables de estado para R dinámica
+    i_pack_prev = 0.0
+    t_pulso = 0.0
     
     idx_global = 0
     
@@ -936,16 +991,51 @@ def simular_con_umbral_adaptativo(
             # ============================================
             # MODELO ELÉCTRICO (SOC)
             # ============================================
+            # ============================================
+            # MODELO ELÉCTRICO (SOC)
+            # ============================================
             v_ocv_pack = f_ocv(soc_actual) * n_s
             
-            if abs(r_pack_ohm) < 1e-6:
+            # --- CÁLCULO DE RESISTENCIA DINÁMICA ---
+            # 1. R del Pack Base (incluyendo cables, pero la dinámica aplica a las celdas)
+            #    R_pack = (R_celda * ns / np) + R_extra
+            #    Calculamos R_celda_dyn y luego escalamos
+            
+            # Usar corriente anterior para estimar efecto Butler-Volmer
+            i_cell_prev = i_pack_prev / n_p
+            
+            r_cell_dyn = _calcular_resistencia_dinamica(
+                r_operative_cell_base, 
+                soc_actual, 
+                T_actual, 
+                i_cell_prev, 
+                t_pulso
+            )
+            
+            r_pack_dyn = (r_cell_dyn * n_s) / n_p
+            
+            # Resolver circuito con R dinámica
+            if abs(r_pack_dyn) < 1e-6:
                 i_pack = P_inst / v_ocv_pack if v_ocv_pack > 0 else 0
             else:
-                discr = v_ocv_pack**2 - 4 * r_pack_ohm * P_inst
+                discr = v_ocv_pack**2 - 4 * r_pack_dyn * P_inst
                 if discr < 0:
                     discr = 0
-                i_pack = (v_ocv_pack - np.sqrt(discr)) / (2 * r_pack_ohm)
+                i_pack = (v_ocv_pack - np.sqrt(discr)) / (2 * r_pack_dyn)
             
+            # Actualizar t_pulso para el siguiente paso (Polarización)
+            # Si hay corriente significativa (> 0.5A por celda aprox => I_pack > n_p * 0.5)
+            # Simplificamos: Si I_pack > 1.0 A (Descarga / Carga significativa)
+            if abs(i_pack) > 1.0:
+                t_pulso += dt
+            else:
+                # Relajación (difusión se equilibra)
+                # Podríamos hacerlo decaer exponencialmente, pero reset a 0 es buena aprox primer orden
+                # o decaimiento rápido: t_pulso = max(0, t_pulso - dt*2)
+                t_pulso = max(0.0, t_pulso - dt * 2.0)
+            
+            i_pack_prev = i_pack
+
             d_soc = -(i_pack * dt) / cap_pack_as * 100.0
             soc_actual = np.clip(soc_actual + d_soc, 0, 100)
             
@@ -953,8 +1043,8 @@ def simular_con_umbral_adaptativo(
             # MODELO TÉRMICO (Pack completo)
             # ============================================
             i_cell = i_pack / n_p
-            # Calor generado: todas las celdas contribuyen (pérdidas Joule)
-            Q_gen_pack = n_celdas_total * (i_cell**2) * r_operative_cell  # [W]
+            # Calor generado: Usamos R dinámica instantánea
+            Q_gen_pack = n_celdas_total * (i_cell**2) * r_cell_dyn  # [W]
             
             # Calor disipado: capacidad total del sistema de refrigeración
             Q_out_pack = refrigeracion * (T_actual - temp_amb)  # [W]
@@ -970,6 +1060,7 @@ def simular_con_umbral_adaptativo(
             soc_full[idx_global] = soc_actual
             temps_full[idx_global] = T_actual
             umbral_full[idx_global] = umbral_actual
+            r_pack_full[idx_global] = r_pack_dyn
             P_elec_full[idx_global] = P_inst
             distancia_full[idx_global] = distancia_acumulada
             
@@ -982,6 +1073,7 @@ def simular_con_umbral_adaptativo(
         'umbral_full': umbral_full,
         'P_elec_full': P_elec_full,
         'distancia_full': distancia_full,
+        'r_pack_full': r_pack_full,
         'soc_final': soc_actual,
         'umbral_final': umbral_actual,
         'distancia_total': distancia_total
@@ -1020,8 +1112,9 @@ def simular_modo_fijo(
     cp = 1000  # J/(kg·K) - Calor específico
 
     # Preparación de parámetros
-    r_operative_cell = (r_interna_mohm / 1000.0) * FACTOR_R_TRANSITORIO
-    r_pack_ohm = (r_operative_cell * n_s) / n_p
+    # Preparación de parámetros
+    r_operative_cell_base = (r_interna_mohm / 1000.0) * FACTOR_R_TRANSITORIO
+    # r_pack_ohm ya no es constante
     cap_pack_as = cap_celda * n_p * 3600.0
     
     n_celdas_total = n_s * n_p
@@ -1037,11 +1130,16 @@ def simular_modo_fijo(
     umbral_full = np.full(n_puntos_total, acc_umbral)
     P_elec_full = np.zeros(n_puntos_total)
     distancia_full = np.zeros(n_puntos_total)
+    r_pack_full = np.zeros(n_puntos_total)
 
     # Estado inicial
     soc_curr = soc_max
     T_curr = temp_amb
     distancia_acumulada = 0.0
+    
+    # Estado dinámico
+    i_pack_prev = 0.0
+    t_pulso = 0.0
     
     idx_global = 0
     t_ciclo = dt * n_puntos_vuelta  # Duración aproximada de una vuelta para la base de tiempo
@@ -1054,14 +1152,35 @@ def simular_modo_fijo(
             vel_i = v_ms_vuelta[i]
             
             # --- MODELO ELÉCTRICO ---
+            # --- MODELO ELÉCTRICO ---
             v_ocv_pack = f_ocv(soc_curr) * n_s
+
+            # R Dinámica
+            i_cell_prev = i_pack_prev / n_p
+            r_cell_dyn = _calcular_resistencia_dinamica(
+                r_operative_cell_base,
+                soc_curr,
+                T_curr,
+                i_cell_prev,
+                t_pulso
+            )
+            r_pack_dyn = (r_cell_dyn * n_s) / n_p
+            r_pack_full[idx_global] = r_pack_dyn
             
-            if abs(r_pack_ohm) < 1e-6:
+            if abs(r_pack_dyn) < 1e-6:
                 i_pack = p_inst / v_ocv_pack if v_ocv_pack > 0 else 0
             else:
-                discr = v_ocv_pack**2 - 4 * r_pack_ohm * p_inst
+                discr = v_ocv_pack**2 - 4 * r_pack_dyn * p_inst
                 if discr < 0: discr = 0
-                i_pack = (v_ocv_pack - np.sqrt(discr)) / (2 * r_pack_ohm)
+                i_pack = (v_ocv_pack - np.sqrt(discr)) / (2 * r_pack_dyn)
+            
+            # Dinámica de tiempo (Polarización)
+            if abs(i_pack) > 1.0:
+                t_pulso += dt
+            else:
+                t_pulso = max(0.0, t_pulso - dt * 2.0)
+            
+            i_pack_prev = i_pack
             
             # Actualizar SOC
             d_soc = -(i_pack * dt) / cap_pack_as * 100.0
@@ -1069,7 +1188,7 @@ def simular_modo_fijo(
             
             # --- MODELO TÉRMICO ---
             i_cell = i_pack / n_p
-            Q_gen = n_celdas_total * (i_cell**2) * r_operative_cell
+            Q_gen = n_celdas_total * (i_cell**2) * r_cell_dyn
             Q_out = refrigeracion * (T_curr - temp_amb)
             dT = ((Q_gen - Q_out) / (mass_pack_kg * cp)) * dt
             T_curr += dT
@@ -1093,6 +1212,7 @@ def simular_modo_fijo(
         'umbral_full': umbral_full,
         'P_elec_full': P_elec_full,
         'distancia_full': distancia_full,
+        'r_pack_full': r_pack_full,
         'soc_final': soc_curr,
         'umbral_final': acc_umbral,
         'distancia_total': distancia_acumulada

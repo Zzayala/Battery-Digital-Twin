@@ -794,6 +794,7 @@ if t_telem is not None and len(t_telem) > 1:
         umbral_full = resultado_sim['umbral_full']
         P_elec_full = resultado_sim['P_elec_full']
         distancia_full = resultado_sim['distancia_full']
+        r_pack_full = resultado_sim.get('r_pack_full', np.zeros_like(t_full))
         umbral_final = resultado_sim['umbral_final']
         
     else:
@@ -819,6 +820,7 @@ if t_telem is not None and len(t_telem) > 1:
         soc_full = resultado_sim['soc_full']
         temps_full = resultado_sim['temps_full']
         umbral_full = resultado_sim['umbral_full']
+        r_pack_full = resultado_sim.get('r_pack_full', np.zeros_like(t_full))
         umbral_final = resultado_sim['umbral_final']
     
     t_max = np.max(temps_full)
@@ -990,7 +992,37 @@ if t_telem is not None and len(t_telem) > 1:
             ax3.xaxis.set_major_formatter(FuncFormatter(time_formatter))
             
             plt.tight_layout()
+            plt.tight_layout()
             st.pyplot(fig1)
+
+            # --- NUEVO: GRÁFICO DE RESISTENCIA DEL PACK (1 VUELTA) ---
+            st.markdown("---")
+            st.subheader("📊 Resistencia Interna Pack (1 Vuelta)")
+            
+            fig_r_lap, ax_r_lap = plt.subplots(figsize=(12, 3))
+            
+            # Tomar solo la primera vuelta (la longitud de t_base)
+            n_puntos_vuelta = len(t_base)
+            # Asegurar que r_pack_full tenga datos (si no se corrió simulación, puede estar vacío o ceros)
+            if 'r_pack_full' in locals() and len(r_pack_full) >= n_puntos_vuelta:
+                r_lap_mohm = r_pack_full[:n_puntos_vuelta] * 1000.0
+                
+                ax_r_lap.plot(t_base, r_lap_mohm, color='#ff9800', linewidth=1.2)
+                ax_r_lap.fill_between(t_base, r_lap_mohm, alpha=0.2, color='#ff9800')
+                
+                # Referencia base
+                r_base_pack_mohm = (r_interna_mohm * n_s / n_p)
+                ax_r_lap.axhline(r_base_pack_mohm, color='white', linestyle='--', alpha=0.5, label='R Base')
+                
+                ax_r_lap.legend(loc='upper right', facecolor='#1a1a2e', edgecolor='#444', labelcolor='white')
+            
+            ax_r_lap.set_ylabel("Resistencia (mΩ)", color='#ff9800')
+            ax_r_lap.tick_params(axis='y', labelcolor='#ff9800')
+            aplicar_estilo_dark(ax_r_lap, "Dinámica de Impedancia (Vuelta 1)", "Tiempo", "")
+            ax_r_lap.xaxis.set_major_formatter(FuncFormatter(time_formatter))
+            
+            plt.tight_layout()
+            st.pyplot(fig_r_lap)
             
             # --- PERFIL AUXILIAR (TAB 1) ---
             st.markdown("---")
@@ -1089,6 +1121,36 @@ if t_telem is not None and len(t_telem) > 1:
 
 
             
+            # === GRÁFICO DE UMBRAL ADAPTATIVO (solo si está activo) ===
+            
+            # --- NUEVO: GRÁFICO DE RESISTENCIA DEL PACK ---
+            st.markdown("---")
+            st.subheader("📊 Evolución de Resistencia Interna (Pack)")
+            
+            fig_r, ax_r = plt.subplots(figsize=(12, 3))
+            
+            # Convertir a mOhms para visualización más clara
+            r_pack_mohm_full = r_pack_full * 1000.0
+            
+            ax_r.plot(t_full, r_pack_mohm_full, color='#ff9800', linewidth=1.2)
+            ax_r.fill_between(t_full, r_pack_mohm_full, alpha=0.2, color='#ff9800')
+            ax_r.set_ylabel("Resistencia Pack (mΩ)", color='#ff9800')
+            ax_r.tick_params(axis='y', labelcolor='#ff9800')
+            
+            # Línea de referencia base (estática)
+            r_base_pack_mohm = (r_interna_mohm * n_s / n_p)
+            ax_r.axhline(r_base_pack_mohm, color='white', linestyle='--', alpha=0.5, label='R Base (Estática)')
+            ax_r.legend(loc='upper right', facecolor='#1a1a2e', edgecolor='#444', labelcolor='white')
+            
+            for v in range(1, n_vueltas):
+                ax_r.axvline(x=v * t_vuelta, color='white', linestyle=':', alpha=0.2)
+                
+            aplicar_estilo_dark(ax_r, "Dinámica de Impedancia Interna", "Tiempo", "")
+            ax_r.xaxis.set_major_formatter(FuncFormatter(time_formatter))
+            
+            plt.tight_layout()
+            st.pyplot(fig_r)
+
             # === GRÁFICO DE UMBRAL ADAPTATIVO (solo si está activo) ===
             if modo_adaptativo:
                 st.markdown("---")
