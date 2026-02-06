@@ -334,7 +334,13 @@ with st.sidebar:
             format="%.2f", key="slider_acc"
         )
         if st.session_state.get('flag_auto_ajuste_completado', False):
-             st.success(f"✅ Ajustado a {st.session_state.slider_acc:.2f} m/s²")
+             val = st.session_state.slider_acc
+             if val <= 0.01:
+                 st.warning(f"⚠️ Saturación Inferior: Ajustado a {val:.2f} m/s². Incluso con máxima asistencia, podría sobrar batería.")
+             elif val >= 12.99:
+                 st.error(f"⚠️ Saturación Superior: Ajustado a {val:.2f} m/s². Incluso con asistencia mínima, podría faltar batería.")
+             else:
+                 st.success(f"✅ Optimizado a {val:.2f} m/s²")
              del st.session_state.flag_auto_ajuste_completado
 
         acc_umbral = st.session_state.slider_acc
