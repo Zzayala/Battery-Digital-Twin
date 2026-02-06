@@ -602,63 +602,87 @@ def generar_perfil_potencia_unificado(
     n_puntos = len(acc_telem)
     P_elec_pack = np.zeros(n_puntos)
     
-    tiempo_acum_pico = 0.0
-    
     # Márgenes de seguridad
     I_cont_safe = I_cont * 0.95
     I_pico_safe = I_pico * 0.95
     V_pack_nom = v_nom_est * n_s
+
+    # Máscaras
+    mask_traction = acc_telem > acc_umbral
+    mask_no_traction = ~mask_traction
     
-    for i in range(len(acc_telem)):
-        acc_i = acc_telem[i]
-        vel_i = v_ms[i]
-        
-        # 1. ZONA DE NO-TRACCIÓN (BAJO UMBRAL)
-        if acc_i <= acc_umbral:
-            # Enfriamos el fusible térmico virtual
-            tiempo_acum_pico = max(0, tiempo_acum_pico - dt * 0.5)
-            
-            # Aplicamos Regen (si frenada) o solo Auxiliar
-            if acc_i < 0:
-                P_elec_pack[i] = -P_regen_vector[i] + p_aux
-            else:
-                P_elec_pack[i] = p_aux
+    # --- 1. ZONA DE NO-TRACCIÓN (Vectorizado) ---
+    # Si acc < 0: -P_regen + p_aux, else: p_aux
+    if np.any(mask_no_traction):
+        P_elec_pack[mask_no_traction] = np.where(
+            acc_telem[mask_no_traction] < 0,
+            -P_regen_vector[mask_no_traction] + p_aux,
+            p_aux
+        )
+
+    # --- 2. PRE-CÁLCULO CANDIDATOS TRACCIÓN (Vectorizado) ---
+    # Vectorizamos todo el array para evitar slicing complejo y mantener claridad,
+    # asumiendo que el overhead de cálculo extra es menor que el de gestión.
+
+    F_inert = masa * acc_telem
+    F_tot = F_inert + F_aero + F_roll
+    P_mech = F_tot * v_ms
+
+    if activar_limite_motor:
+        P_max_mech = p_motor_max_kw * 1000.0
+        P_mech = np.minimum(P_mech, P_max_mech)
+
+    # Potencia demandada mecánica
+    P_dem = np.maximum(P_mech, 0) / eta
+
+    # Límite Grip
+    F_down = 0.5 * rho * v_ms**2 * cl * area
+    Peso_front = masa * 9.81 * dist_peso
+    F_trac_max = (Peso_front + F_down * dist_peso) * mu
+    P_grip = (F_trac_max * v_ms) / eta * margen_traccion
+
+    # Candidato sin límite de batería
+    P_candidate = np.minimum(P_dem, P_grip)
+
+    # --- 3. BUCLE DE ESTADO (Fusible Térmico) ---
+    # Iteramos para gestionar el tiempo_acum_pico y aplicar límite de batería
+    tiempo_acum_pico = 0.0
+
+    # Pre-calculamos límites de batería constantes
+    P_bat_max_pico = V_pack_nom * I_pico_safe * n_p
+    P_bat_max_cont = V_pack_nom * I_cont_safe * n_p
+
+    # Constantes para el bucle
+    dt_up = dt
+    dt_down_fast = dt * 0.5
+    dt_down_slow = dt * 0.2
+
+    # Bucle optimizado: lógica mínima necesaria
+    for i in range(n_puntos):
+        if not mask_traction[i]:
+            # No tracción: enfriamos rápido
+            if tiempo_acum_pico > 0:
+                tiempo_acum_pico = max(0, tiempo_acum_pico - dt_down_fast)
             continue
         
-        # 2. ZONA DE TRACCIÓN (SOBRE UMBRAL)
-        F_inert = masa * acc_i
-        F_tot = F_inert + F_aero[i] + F_roll
-        P_mech = F_tot * vel_i
+        # Tracción: determinamos límite batería según estado
+        P_bat_max = P_bat_max_pico if tiempo_acum_pico < t_pico_max else P_bat_max_cont
         
-        # Limitar Potencia Mecánica por Motor (si aplica)
-        if activar_limite_motor:
-             P_max_mech = p_motor_max_kw * 1000.0
-             P_mech = min(P_mech, P_max_mech)
+        # Seleccionamos potencia real
+        p_cand = P_candidate[i]
+        p_real = min(p_cand, P_bat_max)
         
-        # Límites Eléctricos Dinámicos
-        I_disp = I_pico_safe if tiempo_acum_pico < t_pico_max else I_cont_safe
-        P_bat_max = V_pack_nom * I_disp * n_p
+        P_elec_pack[i] = p_real + p_aux
         
-        # Límite Grip
-        F_down = 0.5 * rho * vel_i**2 * cl * area
-        Peso_front = masa * 9.81 * dist_peso
-        F_trac_max = (Peso_front + F_down * dist_peso) * mu
-        P_grip = (F_trac_max * vel_i) / eta * margen_traccion
-        
-        # Selección de Potencia Real
-        P_dem = P_mech / eta if P_mech > 0 else 0
-        P_real = min(P_dem, P_bat_max, P_grip)
-        
-        P_elec_pack[i] = P_real + p_aux
-        
-        # Gestión del tiempo de pico
-        v_ref_safe = V_pack_nom if V_pack_nom > 1.0 else 1.0
-        corriente_estimada = P_real / v_ref_safe / n_p
-        if corriente_estimada > I_cont_safe:
-            tiempo_acum_pico += dt
+        # Actualizamos estado térmico
+        # Condición: corriente_estimada > I_cont_safe
+        # Simplificación: P_real > P_bat_max_cont (asumiendo V nominal constante)
+        if p_real > P_bat_max_cont:
+             tiempo_acum_pico += dt_up
         else:
-            tiempo_acum_pico = max(0, tiempo_acum_pico - dt * 0.2)
-    
+             if tiempo_acum_pico > 0:
+                tiempo_acum_pico = max(0, tiempo_acum_pico - dt_down_slow)
+
     return P_elec_pack
 
 
