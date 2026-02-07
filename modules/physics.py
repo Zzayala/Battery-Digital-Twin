@@ -438,6 +438,108 @@ def _calc_ocv_high_fidelity(soc, scaling_params):
     return v_scaled
 
 @jit(nopython=True)
+def _simular_paso_fisica_numba(
+    p_inst, dt,
+    soc_curr, T_curr, i_pack_prev, t_pulso,
+    scaling_params, n_s, n_p, r_operative_cell_base, cap_pack_as,
+    temp_amb, refrigeracion, mass_pack_kg, cp
+):
+    """Calcula un paso de simulación física (Eléctrico + Térmico)."""
+    # --- MODELO ELÉCTRICO ---
+    # 1. OCV (High Fidelity)
+    v_cell_ocv = _calc_ocv_high_fidelity(soc_curr, scaling_params)
+    v_ocv_pack = v_cell_ocv * n_s
+
+    # 2. Resistencia Dinámica
+    i_cell_prev = i_pack_prev / n_p
+    r_cell_dyn = _calcular_resistencia_dinamica(
+        r_operative_cell_base,
+        soc_curr,
+        T_curr,
+        i_cell_prev,
+        t_pulso
+    )
+    r_pack_dyn = (r_cell_dyn * n_s) / n_p
+
+    # 3. Corriente Pack
+    i_pack = 0.0
+    if abs(r_pack_dyn) < 1e-6:
+        if v_ocv_pack > 0:
+            i_pack = p_inst / v_ocv_pack
+    else:
+        discr = v_ocv_pack**2 - 4 * r_pack_dyn * p_inst
+        if discr < 0: discr = 0.0
+        i_pack = (v_ocv_pack - np.sqrt(discr)) / (2 * r_pack_dyn)
+
+    # 4. Dinámica de tiempo (Polarización)
+    if abs(i_pack) > 1.0:
+        t_pulso += dt
+    else:
+        t_pulso = t_pulso - dt * 2.0
+        if t_pulso < 0.0: t_pulso = 0.0
+
+    # 5. Actualizar SOC
+    d_soc = -(i_pack * dt) / cap_pack_as * 100.0
+    soc_new = soc_curr + d_soc
+    if soc_new < 0.0: soc_new = 0.0
+    elif soc_new > 100.0: soc_new = 100.0
+
+    # --- MODELO TÉRMICO ---
+    n_celdas_total = n_s * n_p
+    i_cell = i_pack / n_p
+    Q_gen = n_celdas_total * (i_cell**2) * r_cell_dyn
+    Q_out = refrigeracion * (T_curr - temp_amb)
+    dT = ((Q_gen - Q_out) / (mass_pack_kg * cp)) * dt
+    T_new = T_curr + dT
+
+    return soc_new, T_new, i_pack, t_pulso, r_pack_dyn
+
+@jit(nopython=True)
+def _simular_fijo_numba_scalar(
+    P_elec_pack_vuelta, v_ms_vuelta, dt, n_vueltas,
+    soc_max,
+    cap_pack_as, n_s, n_p,
+    r_operative_cell_base,
+    temp_amb, refrigeracion, mass_pack_kg, cp,
+    scaling_params,
+    acc_umbral
+):
+    """
+    Versión ultraligera de _simular_fijo_numba que SOLO calcula el SOC final.
+    Evita la asignación de arrays gigantes (t_full, soc_full, etc.) para optimizar
+    bucles de búsqueda (como buscar_umbral_optimo).
+    """
+    # Arrays de entrada (lectura)
+    n_puntos_vuelta = len(P_elec_pack_vuelta)
+
+    # Estado inicial
+    soc_curr = soc_max
+    T_curr = temp_amb
+    distancia_acumulada = 0.0
+
+    # Estado dinámico resistencia
+    i_pack_prev = 0.0
+    t_pulso = 0.0
+
+    for vuelta in range(n_vueltas):
+        for i in range(n_puntos_vuelta):
+            p_inst = P_elec_pack_vuelta[i]
+            vel_i = v_ms_vuelta[i]
+
+            soc_curr, T_curr, i_pack, t_pulso, _ = _simular_paso_fisica_numba(
+                p_inst, dt,
+                soc_curr, T_curr, i_pack_prev, t_pulso,
+                scaling_params, n_s, n_p, r_operative_cell_base, cap_pack_as,
+                temp_amb, refrigeracion, mass_pack_kg, cp
+            )
+            i_pack_prev = i_pack
+
+            # Actualizar Distancia
+            distancia_acumulada += vel_i * dt
+
+    return soc_curr, distancia_acumulada
+
+@jit(nopython=True)
 def _simular_fijo_numba(
     P_elec_pack_vuelta, v_ms_vuelta, dt, n_vueltas,
     soc_max,
@@ -472,7 +574,6 @@ def _simular_fijo_numba(
     t_pulso = 0.0
 
     # Constantes
-    n_celdas_total = n_s * n_p
     t_ciclo = dt * n_puntos_vuelta
 
     idx_global = 0
@@ -484,54 +585,13 @@ def _simular_fijo_numba(
             p_inst = P_elec_pack_vuelta[i]
             vel_i = v_ms_vuelta[i]
 
-            # --- MODELO ELÉCTRICO ---
-            # 1. OCV (High Fidelity)
-            v_cell_ocv = _calc_ocv_high_fidelity(soc_curr, scaling_params)
-            v_ocv_pack = v_cell_ocv * n_s
-
-            # 2. Resistencia Dinámica
-            i_cell_prev = i_pack_prev / n_p
-            r_cell_dyn = _calcular_resistencia_dinamica(
-                r_operative_cell_base,
-                soc_curr,
-                T_curr,
-                i_cell_prev,
-                t_pulso
+            soc_curr, T_curr, i_pack, t_pulso, r_pack_dyn = _simular_paso_fisica_numba(
+                p_inst, dt,
+                soc_curr, T_curr, i_pack_prev, t_pulso,
+                scaling_params, n_s, n_p, r_operative_cell_base, cap_pack_as,
+                temp_amb, refrigeracion, mass_pack_kg, cp
             )
-            r_pack_dyn = (r_cell_dyn * n_s) / n_p
-
-            # 3. Corriente Pack
-            i_pack = 0.0
-            if abs(r_pack_dyn) < 1e-6:
-                if v_ocv_pack > 0:
-                    i_pack = p_inst / v_ocv_pack
-            else:
-                discr = v_ocv_pack**2 - 4 * r_pack_dyn * p_inst
-                if discr < 0: discr = 0.0
-                i_pack = (v_ocv_pack - np.sqrt(discr)) / (2 * r_pack_dyn)
-
-            # 4. Dinámica de tiempo (Polarización)
-            if abs(i_pack) > 1.0:
-                t_pulso += dt
-            else:
-                t_pulso = t_pulso - dt * 2.0
-                if t_pulso < 0.0: t_pulso = 0.0
-
             i_pack_prev = i_pack
-
-            # 5. Actualizar SOC
-            d_soc = -(i_pack * dt) / cap_pack_as * 100.0
-            soc_curr = soc_curr + d_soc
-            # Clip SOC
-            if soc_curr < 0.0: soc_curr = 0.0
-            elif soc_curr > 100.0: soc_curr = 100.0
-
-            # --- MODELO TÉRMICO ---
-            i_cell = i_pack / n_p
-            Q_gen = n_celdas_total * (i_cell**2) * r_cell_dyn
-            Q_out = refrigeracion * (T_curr - temp_amb)
-            dT = ((Q_gen - Q_out) / (mass_pack_kg * cp)) * dt
-            T_curr += dT
 
             # Actualizar Distancia
             distancia_acumulada += vel_i * dt
@@ -1168,7 +1228,8 @@ def calcular_soc_final_para_umbral(
         refrigeracion=refrigeracion,
         peso_celda_g=peso_celda_g,
         f_ocv=f_ocv,
-        acc_umbral=umbral_test
+        acc_umbral=umbral_test,
+        solo_soc_final=True
     )
 
     return resultado['soc_final']
@@ -1572,7 +1633,8 @@ def simular_modo_fijo(
     r_interna_mohm,
     temp_amb, refrigeracion, peso_celda_g,
     f_ocv,
-    acc_umbral
+    acc_umbral,
+    solo_soc_final=False
 ):
     """
     Simula la carrera paso a paso con un umbral de potencia fijo.
@@ -1584,9 +1646,10 @@ def simular_modo_fijo(
         dt: Delta de tiempo (s)
         n_vueltas: Número de vueltas
         ... resto de parámetros físicos ...
+        solo_soc_final: Si True, usa kernel optimizado que no asigna arrays completos (retorna dict mínimo).
     
     Returns:
-        dict: Resultados completos (t_full, soc_full, etc.)
+        dict: Resultados completos (t_full, soc_full, etc.) o parciales si solo_soc_final=True.
     """
     # Constantes
     cp = 1000.0  # J/(kg·K) - Calor específico
@@ -1618,29 +1681,46 @@ def simular_modo_fijo(
             cp_val = float(cp)
             acc_umbral_val = float(acc_umbral)
 
-            # Numba call
-            t_full, soc_full, temps_full, umbral_full, P_elec_full, distancia_full, r_pack_full, soc_final, dist_total = _simular_fijo_numba(
-                P_elec_pack_vuelta, v_ms_vuelta, dt_val, n_vueltas_val,
-                soc_max_val,
-                cap_pack_as_val, n_s_val, n_p_val,
-                r_op_val,
-                temp_amb_val, refrigeracion_val, mass_pack_kg_val, cp_val,
-                scaling_params,
-                acc_umbral_val
-            )
+            if solo_soc_final:
+                # Kernel ligero: Sin arrays gigantes
+                soc_final, dist_total = _simular_fijo_numba_scalar(
+                    P_elec_pack_vuelta, v_ms_vuelta, dt_val, n_vueltas_val,
+                    soc_max_val,
+                    cap_pack_as_val, n_s_val, n_p_val,
+                    r_op_val,
+                    temp_amb_val, refrigeracion_val, mass_pack_kg_val, cp_val,
+                    scaling_params,
+                    acc_umbral_val
+                )
+                return {
+                    'soc_final': soc_final,
+                    'distancia_total': dist_total,
+                    'umbral_final': acc_umbral
+                }
+            else:
+                # Numba call completa
+                t_full, soc_full, temps_full, umbral_full, P_elec_full, distancia_full, r_pack_full, soc_final, dist_total = _simular_fijo_numba(
+                    P_elec_pack_vuelta, v_ms_vuelta, dt_val, n_vueltas_val,
+                    soc_max_val,
+                    cap_pack_as_val, n_s_val, n_p_val,
+                    r_op_val,
+                    temp_amb_val, refrigeracion_val, mass_pack_kg_val, cp_val,
+                    scaling_params,
+                    acc_umbral_val
+                )
 
-            return {
-                't_full': t_full,
-                'soc_full': soc_full,
-                'temps_full': temps_full,
-                'umbral_full': umbral_full,
-                'P_elec_full': P_elec_full,
-                'distancia_full': distancia_full,
-                'r_pack_full': r_pack_full,
-                'soc_final': soc_final,
-                'umbral_final': acc_umbral,
-                'distancia_total': dist_total
-            }
+                return {
+                    't_full': t_full,
+                    'soc_full': soc_full,
+                    'temps_full': temps_full,
+                    'umbral_full': umbral_full,
+                    'P_elec_full': P_elec_full,
+                    'distancia_full': distancia_full,
+                    'r_pack_full': r_pack_full,
+                    'soc_final': soc_final,
+                    'umbral_final': acc_umbral,
+                    'distancia_total': dist_total
+                }
         except Exception:
             # Fallback on error (just in case)
             pass
