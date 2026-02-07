@@ -346,38 +346,48 @@ def cargar_telemetria_csv(circuito_name):
     path = get_data_path(mapa_archivos[circuito_name], "telemetria")
     
     try:
-        times, speeds, accels = [], [], []
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()
+        # Optimized loading using Pandas
+        df = pd.read_csv(
+            path,
+            sep=';',
+            decimal=',',
+            encoding='utf-8',
+            on_bad_lines='skip',
+            encoding_errors='ignore'
+        )
+
+        # Validar columnas mínimas
+        if df.shape[1] < 3:
+            return None, None, None
             
-        for line in lines[1:]:  # Skip header
-            parts = line.split(';')
-            if len(parts) >= 3:
-                try:
-                    v_str = parts[0].replace(',', '.').strip()
-                    t_str = parts[1].replace(',', '.').strip()
-                    a_str = parts[2].replace(',', '.').strip()
-                    
-                    v_val = float(v_str)
-                    t_val = float(t_str)
-                    a_val = float(a_str)
-                    
-                    if np.isnan(v_val) or np.isnan(t_val) or np.isnan(a_val):
-                        continue
-                    
-                    times.append(t_val)
-                    speeds.append(v_val)
-                    accels.append(a_val)
-                except:
-                    continue
+        # Seleccionar las primeras 3 columnas: [Speed, Time, Acceleration]
+        # Y asegurar tipos numéricos
+        df = df.iloc[:, :3]
+
+        # Convertir a numérico coaccionando errores a NaN
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        # Eliminar filas con NaNs
+        df.dropna(inplace=True)
+
+        if df.empty:
+            return None, None, None
+
+        # Renombrar columnas para facilitar ordenamiento (posición fija)
+        # 0: v, 1: t, 2: a
+        df.columns = ['v', 't', 'a']
         
         # Ordenar por tiempo
-        arr = sorted(zip(times, speeds, accels))
-        t_out = np.array([x[0] for x in arr])
-        v_out = np.array([x[1] for x in arr])
-        a_out = np.array([x[2] for x in arr])
+        df.sort_values(by='t', inplace=True)
+
+        # Extraer arrays
+        v_out = df['v'].values
+        t_out = df['t'].values
+        a_out = df['a'].values
         
         return t_out, v_out, a_out
+
     except Exception as e:
         st.warning(f"Error cargando telemetría: {e}")
         return None, None, None
