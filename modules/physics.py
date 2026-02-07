@@ -84,7 +84,9 @@ def _simular_soc_numba(
     Núcleo de cálculo de evolución de SOC acelerado por Numba.
     No puede usar objetos ni diccionarios, solo arrays y escalares.
     """
+
     soc_actual = soc_inicial
+    min_soc_reached = 100.0
     
     # Pre-extraer coeffs para velocidad (suponemos polyval manual o np.polyval si numba lo soporta)
     # Numba soporta np.polyval parcialmente, pero mejor implementarlo inline para máxima compatibilidad
@@ -131,10 +133,15 @@ def _simular_soc_numba(
             soc_actual = soc_actual + d_soc
             
             # Clamp limits
-            if soc_actual < 0.0: soc_actual = 0.0
+            if soc_actual <= 0.0:
+                 soc_actual = 0.0
+                 min_soc_reached = 0.0
             if soc_actual > 100.0: soc_actual = 100.0
             
-    return soc_actual
+            if soc_actual < min_soc_reached:
+                min_soc_reached = soc_actual
+            
+    return soc_actual, min_soc_reached
 
 
 @jit(nopython=True)
@@ -150,7 +157,7 @@ def _simular_adaptativo_numba(
     n_celdas_total, mass_pack_kg, cp,
     soc_max, soc_min, soc_objetivo,
     distancia_total,
-    umbral_inicial, intervalo_adaptacion_m, margen_traccion,
+    umbral_inicial, margen_traccion,
     ocv_coeffs
 ):
     """
@@ -176,6 +183,7 @@ def _simular_adaptativo_numba(
     distancia_acumulada = 0.0
     ultima_adaptacion_m = 0.0
     tiempo_acum_pico = 0.0
+    error_prev = 0.0
     
     # Estado dinámico para resistencia
     i_pack_prev = 0.0
@@ -200,73 +208,74 @@ def _simular_adaptativo_numba(
             distancia_acumulada += vel_i * dt
 
             # ============================================
-            # CONTROL ADAPTATIVO (cada intervalo_adaptacion_m metros)
+            # CONTROL ADAPTATIVO (Cada 20 metros)
             # ============================================
-            if distancia_acumulada - ultima_adaptacion_m >= intervalo_adaptacion_m:
+            if distancia_acumulada - ultima_adaptacion_m >= 20.0:
                 ultima_adaptacion_m = distancia_acumulada
-
+                
                 # Calcular ratios
                 distancia_restante = distancia_total - distancia_acumulada
                 soc_disponible = soc_actual - soc_objetivo
                 soc_inicial_disponible = soc_max - soc_objetivo
-
+    
                 if distancia_restante > 0 and soc_inicial_disponible > 0:
                     # Ratio de energía restante (0 = agotada, 1 = completa)
                     ratio_energia = soc_disponible / soc_inicial_disponible
                     if ratio_energia < 0: ratio_energia = 0.0
-
+    
                     # Ratio de carrera restante (0 = terminada, 1 = inicio)
                     ratio_distancia = distancia_restante / distancia_total
-
+    
                     # Diferencia: positivo = sobra energía, negativo = falta energía
                     diferencia = ratio_energia - ratio_distancia
                     
                     error_abs = abs(diferencia)
-
+    
                     # === LÓGICA DE DUAL-SPEED (Dos Velocidades) ===
-                    if error_abs < 0.015:
-                        # 1. BANDA MUERTA: Error despreciable (<1.5%), no tocar nada
-                        diferencia = 0.0
-                        K_adaptacion = 0.0
-                        SLEW_RATE_MAX = 0.0 # No hay cambio
-                        ALPHA_EMA = 0.0 # No actualizar
-                    elif error_abs > 0.15:
-                        # 2. MODO TURBO: Error grande (>15%), corregir AGRESIVAMENTE
-                        # Útil para corregir malas condiciones iniciales rápido
-                        K_adaptacion = 1.5
-                        SLEW_RATE_MAX = 2.0  # Permitir saltos grandes
-                        ALPHA_EMA = 0.6      # Poca memoria, mucha reacción
-                    else:
-                         # 3. MODO CRUCERO: Error normal, corrección suave
-                        K_adaptacion = 0.6
-                        SLEW_RATE_MAX = 0.5
-                        ALPHA_EMA = 0.2
+                    # K y ALPHA siguen siendo discretos para estabilidad
+                    
+                    # CÁLCULO INTELIGENTE DE SLEW_RATE (Velocidad de cambio)
+                    # Base 0.2 + Proporcional al error (x20) -> Tope 2.5
+                    SLEW_RATE_MAX = 0.2 + (15.0 * error_abs)
+                    if SLEW_RATE_MAX > 2.5: SLEW_RATE_MAX = 2.5
 
-                    # === PROTECCIÓN FINAL DE CARRERA ===
-                    # Si queda <10% de carrera, forzar modo conservador para evitar latigazos
+                    # === ADAPTACIÓN CONTINUA (Infinitos Niveles) ===
+                    # K crece con el error para vencer la resistencia
+                    K_adaptacion = 0.5 + (55.0 * error_abs)
+                    if K_adaptacion > 6.0: K_adaptacion = 6.0
+                    
+                    # ALPHA crece con el error para reaccionar más rápido
+                    ALPHA_EMA = 0.9 + (6.0 * error_abs)
+                    if ALPHA_EMA > 0.95: ALPHA_EMA = 0.95
+    
+                    # === PROTECCIÓN FINAL DE CARRERA (Asimétrica) ===
                     if ratio_distancia < 0.10:
-                        K_adaptacion = 0.3
-                        SLEW_RATE_MAX = 0.3
-                        ALPHA_EMA = 0.1
-
-                    if ALPHA_EMA > 0:
-                        # Ajuste proporcional
-                        delta_umbral_raw = -diferencia * K_adaptacion
-
-                        # Limiter
-                        if delta_umbral_raw > SLEW_RATE_MAX:
-                            delta_umbral_limited = SLEW_RATE_MAX
-                        elif delta_umbral_raw < -SLEW_RATE_MAX:
-                            delta_umbral_limited = -SLEW_RATE_MAX
+                        if diferencia < -0.005:
+                            # MODO SUPERVIVENCIA: Nos falta energía al final -> Prioridad ABSOLUTA al SOC
+                            K_adaptacion = 3.0
+                            SLEW_RATE_MAX = 2.0
+                            ALPHA_EMA = 0.8
                         else:
-                            delta_umbral_limited = delta_umbral_raw
+                            # ATERRIZAJE SUAVE: Vamos bien -> Prioridad a la estabilidad
+                            K_adaptacion = 0.3
+                            SLEW_RATE_MAX = 0.3
+                            ALPHA_EMA = 0.1
+    
+                    if ALPHA_EMA > 0:
+                        # Ajuste PD con FRENO DINÁMICO
+                        # Si hay mucho error, soltamos freno (3.0) para correr. Si hay poco, frenamos (12.0) para estabilizar.
+                        K_D = 30.0 - (200.0 * error_abs)
+                        if K_D < 3.0: K_D = 3.0
                         
-                        # Filtro EMA
+                        delta_umbral_raw = - (diferencia * K_adaptacion + (diferencia - error_prev) * K_D)
+                        
+                        delta_umbral_limited = np.clip(delta_umbral_raw, -SLEW_RATE_MAX, SLEW_RATE_MAX)
+                        
                         umbral_calculado = umbral_actual + delta_umbral_limited
                         umbral_suavizado = ALPHA_EMA * umbral_calculado + (1.0 - ALPHA_EMA) * umbral_actual
-                        
-                        # Clamping
                         umbral_actual = np.clip(umbral_suavizado, UMBRAL_MIN, UMBRAL_MAX)
+                
+                error_prev = diferencia # Update error_prev at the end of the adaptive block
 
             # ============================================
             # CÁLCULO DE POTENCIA
@@ -946,7 +955,11 @@ def calcular_soc_final_para_umbral(
     dt,
     margen_traccion=0.90,
     activar_limite_motor=False,
-    p_motor_max_kw=0.0
+    p_motor_max_kw=0.0,
+    temp_amb=25.0,
+    refrigeracion=20.0,
+    peso_celda_g=100.0,
+    **kwargs
 ):
     """
     Calcula el SOC final simulando con la curva OCV real.
@@ -975,37 +988,25 @@ def calcular_soc_final_para_umbral(
         p_motor_max_kw=p_motor_max_kw
     )
     
-    # 3. Integración temporal (Acelerada con Numba si es posible)
-    # Extraer coeficientes del polinomio f_ocv para pasarlos a Numba
-    # f_ocv es un numpy.poly1d
-    ocv_coeffs = f_ocv.coeffs
-    
-    # Pre-cálculo de constantes
-    cap_pack_as = cap_celda * n_p * 3600.0
-    r_pack_ohm = (r_interna_mohm / 1000.0 * n_s) / n_p
-    
-    # Asegurar tipos float64 para numba
-    P_elec_pack = P_elec_pack.astype(np.float64)
-    dt = float(dt)
-    n_vueltas = int(n_vueltas)
-    soc_max = float(soc_max)
-    cap_pack_as = float(cap_pack_as)
-    r_pack_ohm = float(r_pack_ohm)
-    ocv_coeffs = ocv_coeffs.astype(np.float64)
-    n_s = float(n_s)
-
-    soc_actual = _simular_soc_numba(
-        P_elec_pack, 
-        dt, 
-        n_vueltas, 
-        soc_max,
-        cap_pack_as,
-        r_pack_ohm,
-        n_s, 
-        ocv_coeffs
+    # 3. Simulación completa (Térmica + Dinámica + Degradación)
+    resultado = simular_modo_fijo(
+        P_elec_pack_vuelta=P_elec_pack,
+        v_ms_vuelta=v_ms,
+        dt=dt,
+        n_vueltas=n_vueltas,
+        soc_max=soc_max,
+        cap_celda=cap_celda,
+        n_s=n_s,
+        n_p=n_p,
+        r_interna_mohm=r_interna_mohm,
+        temp_amb=temp_amb,
+        refrigeracion=refrigeracion,
+        peso_celda_g=peso_celda_g,
+        f_ocv=f_ocv,
+        acc_umbral=umbral_test
     )
-            
-    return soc_actual
+        
+    return resultado['soc_final']
 
 
 # =============================================================================
@@ -1108,7 +1109,6 @@ def simular_con_umbral_adaptativo(
     temp_amb, refrigeracion,
     peso_celda_g=100.0,
     umbral_inicial=4.0,
-    intervalo_adaptacion_m=50.0,
     margen_soc_final=0.5,
     margen_traccion=0.90
 ):
@@ -1164,7 +1164,6 @@ def simular_con_umbral_adaptativo(
     soc_objetivo = float(soc_objetivo)
     distancia_total = float(distancia_total)
     umbral_inicial = float(umbral_inicial)
-    intervalo_adaptacion_m = float(intervalo_adaptacion_m)
     margen_traccion = float(margen_traccion)
     n_s = float(n_s)
     n_p = float(n_p)
@@ -1174,7 +1173,7 @@ def simular_con_umbral_adaptativo(
     if NUMBA_AVAILABLE:
         # === EJECUCIÓN CON NUMBA (RÁPIDA) ===
         try:
-           t_full, soc_full, temps_full, umbral_full, P_elec_full, distancia_full, soc_final, umbral_final = _simular_adaptativo_numba(
+           t_full, soc_full, temps_full, umbral_full, P_elec_full, distancia_full, soc_final, umbral_final, r_pack_full = _simular_adaptativo_numba(
                 acc_telem, v_ms, float(dt), int(n_vueltas),
                 float(masa), F_aero, F_roll, eta,
                 float(I_cont), float(I_pico), float(t_pico_max),
@@ -1186,12 +1185,9 @@ def simular_con_umbral_adaptativo(
                 float(n_celdas_total), float(mass_pack_kg), float(cp),
                 float(soc_max), float(soc_min), float(soc_objetivo),
                 float(distancia_total),
-                float(umbral_inicial), float(intervalo_adaptacion_m), float(margen_traccion),
+                float(umbral_inicial), float(margen_traccion),
                 ocv_coeffs
             )
-           
-           # Generar array dummy de resistencia para mantener compatibilidad con gráficos
-           r_pack_full = np.full_like(t_full, r_pack_ohm)
            
            return {
                 't_full': t_full,
@@ -1215,14 +1211,14 @@ def simular_con_umbral_adaptativo(
         acc_telem, v_ms, dt, n_vueltas, masa, F_aero, F_roll, eta, I_cont, I_pico, t_pico_max,
         V_pack_nom, n_s, n_p, cap_pack_as, r_pack_ohm, r_operative_cell, p_aux, P_regen_vector,
         mu, rho, cl, area, dist_peso, temp_amb, refrigeracion, n_celdas_total, mass_pack_kg, cp,
-        soc_max, soc_min, soc_objetivo, distancia_total, umbral_inicial, intervalo_adaptacion_m, margen_traccion, ocv_coeffs
+        soc_max, soc_min, soc_objetivo, distancia_total, umbral_inicial, margen_traccion, ocv_coeffs
     )
 
 def _simular_adaptativo_python_legacy(
     acc_telem, v_ms, dt, n_vueltas, masa, F_aero, F_roll, eta, I_cont, I_pico, t_pico_max,
     V_pack_nom, n_s, n_p, cap_pack_as, r_pack_ohm, r_operative_cell, p_aux, P_regen_vector,
     mu, rho, cl, area, dist_peso, temp_amb, refrigeracion, n_celdas_total, mass_pack_kg, cp,
-    soc_max, soc_min, soc_objetivo, distancia_total, umbral_inicial, intervalo_adaptacion_m, margen_traccion, ocv_coeffs
+    soc_max, soc_min, soc_objetivo, distancia_total, umbral_inicial, margen_traccion, ocv_coeffs
 ):
     """Versión Legacy en Python (lenta) para cuando Numba no esta disponible."""
     # Arrays de salida
@@ -1245,6 +1241,7 @@ def _simular_adaptativo_python_legacy(
     distancia_acumulada = 0.0
     ultima_adaptacion_m = 0.0
     tiempo_acum_pico = 0.0
+    error_prev = 0.0
     
     # Estado dinámico resistencia
     i_pack_prev = 0.0
@@ -1265,7 +1262,7 @@ def _simular_adaptativo_python_legacy(
             
             # --- Lógica Adaptativa (Igual que Numba) ---
             distancia_acumulada += vel_i * dt
-            if distancia_acumulada - ultima_adaptacion_m >= intervalo_adaptacion_m:
+            if distancia_acumulada - ultima_adaptacion_m >= 20.0:
                 ultima_adaptacion_m = distancia_acumulada
                 distancia_restante = distancia_total - distancia_acumulada
                 soc_disponible = soc_actual - soc_objetivo
@@ -1276,13 +1273,46 @@ def _simular_adaptativo_python_legacy(
                     ratio_distancia = distancia_restante / distancia_total
                     diferencia = ratio_energia - ratio_distancia
                     
-                    K_adaptacion = 0.7
-                    delta_umbral_raw = -diferencia * K_adaptacion
-                    delta_umbral_limited = np.clip(delta_umbral_raw, -0.5, 0.5)
+                    error_abs = abs(diferencia)
                     
-                    umbral_calculado = umbral_actual + delta_umbral_limited
-                    umbral_suavizado = 0.3 * umbral_calculado + 0.7 * umbral_actual
-                    umbral_actual = np.clip(umbral_suavizado, UMBRAL_MIN, UMBRAL_MAX)
+                    # CÁLCULO INTELIGENTE DE SLEW_RATE
+                    SLEW_RATE_MAX = 0.2 + (20.0 * error_abs)
+                    if SLEW_RATE_MAX > 2.5: SLEW_RATE_MAX = 2.5
+                    
+                    # === ADAPTACIÓN CONTINUA (Infinitos Niveles) ===
+                    K_adaptacion = 0.4 + (45.0 * error_abs)
+                    if K_adaptacion > 6.0: K_adaptacion = 6.0
+                    
+                    ALPHA_EMA = 0.5 + (4.0 * error_abs)
+                    if ALPHA_EMA > 0.95: ALPHA_EMA = 0.95
+                        
+                    # Protección final (Asimétrica)
+                    if ratio_distancia < 0.10:
+                        if diferencia < -0.005:
+                            # MODO SUPERVIVENCIA
+                            K_adaptacion = 3.0
+                            SLEW_RATE_MAX = 2.0
+                            ALPHA_EMA = 0.8
+                        else:
+                            # ATERRIZAJE SUAVE
+                            K_adaptacion = 0.3
+                            SLEW_RATE_MAX = 0.3 
+                            ALPHA_EMA = 0.1
+                        
+                    if ALPHA_EMA > 0:
+                        # Ajuste PD Adaptativo Inverso
+                        K_D = 12.0 - (100.0 * error_abs)
+                        if K_D < 3.0: K_D = 3.0
+                        
+                        delta_umbral_raw = - (diferencia * K_adaptacion + (diferencia - error_prev) * K_D)
+                        
+                        delta_umbral_limited = np.clip(delta_umbral_raw, -SLEW_RATE_MAX, SLEW_RATE_MAX)
+                        
+                        umbral_calculado = umbral_actual + delta_umbral_limited
+                        umbral_suavizado = ALPHA_EMA * umbral_calculado + (1.0 - ALPHA_EMA) * umbral_actual
+                        umbral_actual = np.clip(umbral_suavizado, UMBRAL_MIN, UMBRAL_MAX)
+                
+                error_prev = diferencia
             
             # --- Cálculo Potencia ---
             if acc_i <= umbral_actual:
@@ -1394,12 +1424,11 @@ def simular_modo_fijo(
         dict: Resultados completos (t_full, soc_full, etc.)
     """
     # Constantes
-    FACTOR_R_TRANSITORIO = 1.25
     cp = 1000  # J/(kg·K) - Calor específico
 
     # Preparación de parámetros
     # Preparación de parámetros
-    r_operative_cell_base = (r_interna_mohm / 1000.0) * FACTOR_R_TRANSITORIO
+    r_operative_cell_base = (r_interna_mohm / 1000.0)
     # r_pack_ohm ya no es constante
     cap_pack_as = cap_celda * n_p * 3600.0
     
