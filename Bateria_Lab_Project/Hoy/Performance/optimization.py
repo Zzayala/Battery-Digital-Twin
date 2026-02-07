@@ -20,39 +20,39 @@ from .physics import calcular_soc_final_para_umbral
 def buscar_umbral_optimo(soc_minimo, acc_telem, v_ms, n_vueltas, params):
     """
     Busca el umbral más bajo posible que mantenga SOC final >= soc_minimo.
-    
+
     Objetivo: Gastar toda la batería permitida, llegando justo al SOC mínimo.
-    
+
     Lógica:
     - Umbral BAJO = más consumo = SOC final MÁS BAJO
     - Umbral ALTO = menos consumo = SOC final MÁS ALTO
-    
+
     Buscamos el umbral más bajo donde SOC final >= soc_minimo
-    
+
     Args:
         soc_minimo: SOC mínimo objetivo (%)
         acc_telem: Array de aceleraciones de telemetría (m/s²)
         v_ms: Array de velocidades (m/s)
         n_vueltas: Número de vueltas a simular
         params: Diccionario con todos los parámetros físicos necesarios
-    
+
     Returns:
         tuple: (umbral_optimo, soc_final_optimo, log_pruebas)
                El log es una lista de dicts con info de debug para UI
     """
     UMBRAL_MINIMO = 0.0
     UMBRAL_MAXIMO = 13.0
-    
+
     # Rango objetivo: [SOC_Min + 1%, SOC_Min + 2%]
     # Ajuste según nuevo requerimiento: soc_min es límite duro. Buscamos dejar un margen de seguridad.
     soc_target_min = soc_minimo + 1.5
     soc_target_max = soc_minimo + 2.5
-    
+
     # Log para debug
     log_pruebas = []
-    
+
     # --- 1. Verificar extremos primero ---
-    
+
     # Caso A: ¿Qué pasa si ayudamos SIEMPRE (Umbral 0)? (Máximo consumo posible)
     soc_con_umbral_min = calcular_soc_final_para_umbral(
         UMBRAL_MINIMO, acc_telem, v_ms, n_vueltas, **params
@@ -61,23 +61,23 @@ def buscar_umbral_optimo(soc_minimo, acc_telem, v_ms, n_vueltas, params):
     if soc_con_umbral_min >= soc_target_min:
          log_pruebas.append({'iter': 0, 'umbral': UMBRAL_MINIMO, 'soc': round(soc_con_umbral_min, 2), 'decision': 'OPTIMO_DIRECTO_MIN'})
          return UMBRAL_MINIMO, soc_con_umbral_min, log_pruebas
-    
+
     # Caso B: ¿Qué pasa si NO ayudamos NUNCA (Umbral 13)? (Mínimo consumo posible)
     soc_con_umbral_max = calcular_soc_final_para_umbral(
         UMBRAL_MAXIMO, acc_telem, v_ms, n_vueltas, **params
     )
-    
+
     # Caso C: Si ahorrando al máximo no llegamos al mínimo -> Devolver MAX (Mejor esfuerzo para sobrevivir)
     if soc_con_umbral_max < soc_target_min:
          log_pruebas.append({'iter': 0, 'umbral': UMBRAL_MAXIMO, 'soc': round(soc_con_umbral_max, 2), 'decision': 'FALLO_COBERTURA_MAX'})
          return UMBRAL_MAXIMO, soc_con_umbral_max, log_pruebas
-    
+
     # --- 2. Bisección con Rastreo del Mejor Válido ---
     # Si estamos aquí, la solución cruza el objetivo en algún punto entre 0 y 13.
     # Inicializamos el "mejor conocido" con el caso seguro (MAXIMO), que sabemos que cumple (soc_max >= target_min)
     mejor_umbral = UMBRAL_MAXIMO
     mejor_soc = soc_con_umbral_max
-    
+
     umbral_bajo, umbral_alto = UMBRAL_MINIMO, UMBRAL_MAXIMO
     max_iter = 25
 
@@ -87,7 +87,7 @@ def buscar_umbral_optimo(soc_minimo, acc_telem, v_ms, n_vueltas, params):
 
     # Tolerancia de convergencia alineada con el paso del slider (0.01)
     TOLERANCIA = 0.01 # Más fina para evitar estancamiento prematuro, el bucle saldrá por iteraciones si oscila
-    
+
     for i in range(max_iter):
         # Calculamos el punto medio matemático
         mid_point = (umbral_bajo + umbral_alto) / 2.0
@@ -108,10 +108,10 @@ def buscar_umbral_optimo(soc_minimo, acc_telem, v_ms, n_vueltas, params):
         soc_final = calcular_soc_final_para_umbral(
             umbral_test, acc_telem, v_ms, n_vueltas, **params
         )
-        
+
         decision = ""
         es_valido = False
-        
+
         # Analizar resultado
         if soc_target_min <= soc_final <= soc_target_max:
             # ¡Dimos en el clavo! (Ventana perfecta)
@@ -122,21 +122,21 @@ def buscar_umbral_optimo(soc_minimo, acc_telem, v_ms, n_vueltas, params):
             # Como queremos el umbral MÁS BAJO posible, tratamos esto como si fuera un "Exceso" (podemos gastar más)
             # Así forzamos al algoritmo a probar umbrales más bajos.
             umbral_alto = umbral_test
-            
+
         elif soc_final < soc_target_min:
             # DEFICIT: Nos falta batería -> Consumo Excesivo -> SUBIR Umbral (Ayudar menos)
             # El óptimo debe estar entre [umbral_test, umbral_alto]
             umbral_bajo = umbral_test
             decision = 'DEFICIT_SUBIR'
             es_valido = False
-            
+
         else: # soc_final > soc_target_max
             # EXCESO: Nos sobra batería -> Consumo Bajo -> BAJAR Umbral (Ayudar más)
             # El óptimo debe estar entre [umbral_bajo, umbral_test]
             umbral_alto = umbral_test
             decision = 'EXCESO_BAJAR'
             es_valido = True
-        
+
         # Actualizar "Mejor Candidato Válido"
         # Queremos el umbral más BAJO (más agresivo) posible que cumpla soc >= soc_min
         # Si este intento es válido (nos sobra batería) y es menor que el mejor conocido, lo guardamos.
@@ -147,19 +147,19 @@ def buscar_umbral_optimo(soc_minimo, acc_telem, v_ms, n_vueltas, params):
             if umbral_test < mejor_umbral:
                 mejor_umbral = umbral_test
                 mejor_soc = soc_final
-        
+
         log_pruebas.append({
-            'iter': i + 1, 
+            'iter': i + 1,
             'umbral': umbral_test, # Ya está redondeado a 2
             'soc': round(soc_final, 2),
             'decision': decision
         })
-        
+
         # Tolerancia de convergencia
         # ELIMINADO: Se fuerza a correr todas las iteraciones para refinar al máximo
         # if (umbral_alto - umbral_bajo) < TOLERANCIA:
         #    break
-            
+
     # Si salimos del bucle devuelve el MEJOR VÁLIDO encontrado.
     log_pruebas.append({
         'iter': 'FINAL',
@@ -187,7 +187,7 @@ def preparar_parametros_optimizacion(
 ):
     """
     Prepara el diccionario de parámetros para la función de optimización.
-    
+
     Args:
         cap_celda, r_interna_mohm, n_s, n_p, soc_max: Params Pila/Pack
         i_descarga_cont, i_descarga_pico, t_descarga_pico: Límites Pila
@@ -197,18 +197,18 @@ def preparar_parametros_optimizacion(
         cl, area, dist_peso: Dinámica
         temp_amb, refrigeracion, peso_celda_g: Térmicos
         activar_limite_motor, p_motor_max_kw: Extra
-    
+
     Returns:
         dict: Parámetros listos para buscar_umbral_optimo
     """
     from .physics import CONSTANTES_VEHICULO
-    
+
     return {
         'masa': masa_vehiculo,
         'F_aero': F_aero,
         'F_roll': F_roll,
         'eta': eta_total,
-        
+
         # Parámetros directos (ya procesados por SOH o snapshot)
         'I_cont': i_descarga_cont,
         'I_pico': i_descarga_pico,
@@ -221,7 +221,7 @@ def preparar_parametros_optimizacion(
         'n_s': n_s,
         'n_p': n_p,
         'soc_max': soc_max,
-        
+
         # Parámetros adicionales
         'p_aux': p_media_aux_w,
         'dt': dt_sim,

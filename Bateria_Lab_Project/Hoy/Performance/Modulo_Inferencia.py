@@ -11,7 +11,7 @@ Para extrapolar datos de laboratorio (celdas pequeñas) a tu pack (celdas grande
 calculamos una métrica agnóstica del tamaño:
 
     Métrica = Caída de Voltaje Normalizada por Ciclo (a 1C)
-    
+
 Luego, en aging.py, se des-normaliza:
     Delta_R (Ohm) = Métrica / Capacidad_Tu_Celda (Ah)
 """
@@ -35,7 +35,7 @@ class CerebroDegradacion:
         # 1. Si el usuario da una ruta y existe, usarla
         if ruta_usuario and os.path.exists(ruta_usuario):
             return ruta_usuario
-            
+
         # 2. Rutas candidatas automáticas (Prioridad: carpeta data/)
         candidatos = [
             os.path.join("data", "Resultado_Analisis_Bateria.csv"),  # Estándar
@@ -44,11 +44,11 @@ class CerebroDegradacion:
             os.path.join(os.path.dirname(__file__), "data", "Resultado_Analisis_Bateria.csv"),
             r"C:\Temp_Analisis\Bateria_Lab_Project\data\Resultado_Analisis_Bateria.csv"
         ]
-        
+
         for ruta in candidatos:
             if os.path.exists(ruta):
                 return ruta
-                
+
         return "data/Resultado_Analisis_Bateria.csv" # Fallback
 
     def _cargar_y_reparar_datos(self):
@@ -67,10 +67,10 @@ class CerebroDegradacion:
                     print(f"[IA] ❌ Error: Falta columna '{col}' en el CSV.")
                     return
                 self.df[col] = pd.to_numeric(self.df[col], errors='coerce')
-            
+
             # Eliminar filas corruptas
             self.df = self.df.dropna(subset=cols_req)
-            
+
             # 3. --- CÁLCULO DE MÉTRICA DE RESISTENCIA NORMALIZADA ---
             # Problema: R (Ohms) depende del tamaño de la celda (1/Capacidad).
             # Solución: Usar "Caída de Voltaje Normalizada".
@@ -82,27 +82,27 @@ class CerebroDegradacion:
             #
             #   Queremos una métrica 'M' tal que: Delta_R_usuario = M / Capacidad_usuario
             #   Por tanto: M = Delta_R * Capacidad = Delta_V / C_rate
-            
+
             # Evitar división por cero si C_rate es muy bajo
             c_rates_seguros = self.df['C_rate'].replace(0, 0.1)
-            
+
             # Métrica = Voltios perdidos por ciclo si descargáramos a 1C
             # Unidades: [V / ciclo] (independiente de Ah)
             self.df['voltage_drop_norm_per_cycle'] = self.df['Slope_EODV'].abs() / c_rates_seguros
-            
+
             # 4. Normalizar degradación de capacidad (%/ciclo)
             self.df['capacity_fade_pct'] = self.df['Slope_Capacity'].abs() / self.df['Cap_Max']
-            
+
             # 5. Filtros de Calidad
             # Descartamos celdas con degradación absurda (ruido de medición)
             # Umbral: > 5mV por ciclo normalizado es probablemente fallo de test, no degradación natural
-            self.df = self.df[self.df['voltage_drop_norm_per_cycle'] < 0.010] 
+            self.df = self.df[self.df['voltage_drop_norm_per_cycle'] < 0.010]
             self.df = self.df[self.df['capacity_fade_pct'] < 0.005]
 
             print(f"[IA] ✅ Cerebro cargado: {len(self.df)} perfiles.")
             print(f"     - Deg. Cap Media: {self.df['capacity_fade_pct'].mean():.5%}/ciclo")
             print(f"     - Métrica Res. Media: {self.df['voltage_drop_norm_per_cycle'].mean():.6f} V_norm/ciclo")
-            
+
             self.datos_cargados = True
 
         except Exception as e:
@@ -111,10 +111,10 @@ class CerebroDegradacion:
     def predecir_degradacion(self, c_rate_usuario, temperatura_usuario=25.0, dod_usuario=100.0):
         """
         Retorna las tasas BASE de envejecimiento.
-        
+
         Args:
             c_rate_usuario (float): Tasa de descarga efectiva.
-            
+
         Returns:
             deg_cap_base (float): % Capacidad perdida por ciclo.
             metric_res_norm (float): Métrica de voltaje normalizada (NO SON OHMIOS DIRECTOS).
