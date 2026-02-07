@@ -513,7 +513,7 @@ def generar_perfil_potencia_unificado(
     v_nom_est, n_s, n_p,
     p_aux, P_regen_vector,
     mu, rho, cl, area, dist_peso,
-    acc_umbral=4.0,
+    acc_umbral,
     margen_traccion=0.90,
     activar_limite_motor=False,
     p_motor_max_kw=0.0

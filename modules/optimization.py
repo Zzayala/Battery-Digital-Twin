@@ -76,7 +76,7 @@ def buscar_umbral_optimo(soc_minimo, acc_telem, v_ms, n_vueltas, params):
     mejor_soc = soc_con_umbral_max
     
     umbral_bajo, umbral_alto = UMBRAL_MINIMO, UMBRAL_MAXIMO
-    max_iter = 20 # Iteraciones suficientes para precisión
+    max_iter = 50 # Iteraciones suficientes para precisión
     
     for i in range(max_iter):
         umbral_test = (umbral_bajo + umbral_alto) / 2.0
@@ -119,7 +119,7 @@ def buscar_umbral_optimo(soc_minimo, acc_telem, v_ms, n_vueltas, params):
         })
         
         # Tolerancia de convergencia
-        if (umbral_alto - umbral_bajo) < 0.05:
+        if (umbral_alto - umbral_bajo) < 0.005:
             break
             
     # Si salimos del bucle sin "EXITO" exacto, devolvemos el MEJOR VALIDO encontrado
