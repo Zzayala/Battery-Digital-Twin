@@ -2,6 +2,7 @@
 Módulo de física: Cálculos de potencia, SOC, regeneración y simulación.
 """
 
+import math
 import numpy as np
 from scipy.optimize import minimize_scalar
 try:
@@ -1728,35 +1729,52 @@ def simular_modo_fijo(
     # Arrays de salida
     n_puntos_vuelta = len(P_elec_pack_vuelta)
     n_puntos_total = n_puntos_vuelta * n_vueltas
-    
-    t_full = np.zeros(n_puntos_total)
-    soc_full = np.zeros(n_puntos_total)
-    temps_full = np.zeros(n_puntos_total)
-    umbral_full = np.full(n_puntos_total, acc_umbral)
-    P_elec_full = np.zeros(n_puntos_total)
-    distancia_full = np.zeros(n_puntos_total)
-    r_pack_full = np.zeros(n_puntos_total)
+
+    # Si solo necesitamos SOC final, evitamos crear arrays grandes
+    if solo_soc_final:
+        t_full = None
+        soc_full = None
+        temps_full = None
+        umbral_full = None
+        P_elec_full = None
+        distancia_full = None
+        r_pack_full = None
+    else:
+        # Pre-cálculo vectorizado de variables independientes del estado
+        t_full = np.arange(n_puntos_total) * dt
+        umbral_full = np.full(n_puntos_total, acc_umbral)
+        P_elec_full = np.tile(P_elec_pack_vuelta, n_vueltas)
+
+        # Distancia acumulada vectorizada
+        dist_lap = np.cumsum(v_ms_vuelta * dt)
+        lap_dist_total = dist_lap[-1]
+        lap_offsets = np.arange(n_vueltas) * lap_dist_total
+
+        # Broadcasting manual optimizado (sin bucles Python)
+        distancia_full = np.tile(dist_lap, n_vueltas) + np.repeat(lap_offsets, n_puntos_vuelta)
+
+        soc_full = np.zeros(n_puntos_total)
+        temps_full = np.zeros(n_puntos_total)
+        r_pack_full = np.zeros(n_puntos_total)
 
     # Estado inicial
     soc_curr = soc_max
     T_curr = temp_amb
-    distancia_acumulada = 0.0
     
     # Estado dinámico
     i_pack_prev = 0.0
     t_pulso = 0.0
 
     idx_global = 0
-    t_ciclo = dt * n_puntos_vuelta  # Duración aproximada de una vuelta para la base de tiempo
+
+    # Optimizacion: Extraer constantes del bucle
+    # math.sqrt es mas rapido que np.sqrt para escalares
+    sqrt = math.sqrt
 
     for vuelta in range(n_vueltas):
-        t_inicio_vuelta = vuelta * t_ciclo
-        
         for i in range(n_puntos_vuelta):
             p_inst = P_elec_pack_vuelta[i]
-            vel_i = v_ms_vuelta[i]
             
-            # --- MODELO ELÉCTRICO ---
             # --- MODELO ELÉCTRICO ---
             v_ocv_pack = f_ocv(soc_curr) * n_s
 
@@ -1770,14 +1788,16 @@ def simular_modo_fijo(
                 t_pulso
             )
             r_pack_dyn = (r_cell_dyn * n_s) / n_p
-            r_pack_full[idx_global] = r_pack_dyn
+
+            if not solo_soc_final:
+                r_pack_full[idx_global] = r_pack_dyn
             
             if abs(r_pack_dyn) < 1e-6:
                 i_pack = p_inst / v_ocv_pack if v_ocv_pack > 0 else 0
             else:
                 discr = v_ocv_pack**2 - 4 * r_pack_dyn * p_inst
                 if discr < 0: discr = 0
-                i_pack = (v_ocv_pack - np.sqrt(discr)) / (2 * r_pack_dyn)
+                i_pack = (v_ocv_pack - sqrt(discr)) / (2 * r_pack_dyn)
 
             # Dinámica de tiempo (Polarización)
             if abs(i_pack) > 1.0:
@@ -1789,7 +1809,7 @@ def simular_modo_fijo(
             
             # Actualizar SOC
             d_soc = -(i_pack * dt) / cap_pack_as * 100.0
-            soc_curr = np.clip(soc_curr + d_soc, 0, 100)
+            soc_curr = max(0.0, min(100.0, soc_curr + d_soc)) # clamp manual rapido
             
             # --- MODELO TÉRMICO ---
             i_cell = i_pack / n_p
@@ -1798,17 +1818,23 @@ def simular_modo_fijo(
             dT = ((Q_gen - Q_out) / (mass_pack_kg * cp)) * dt
             T_curr += dT
             
-            # Actualizar Distancia
-            distancia_acumulada += vel_i * dt
-            
-            # Guardar datos
-            t_full[idx_global] = t_inicio_vuelta + i * dt
-            soc_full[idx_global] = soc_curr
-            temps_full[idx_global] = T_curr
-            P_elec_full[idx_global] = p_inst
-            distancia_full[idx_global] = distancia_acumulada
-            
-            idx_global += 1
+            # Guardar datos (solo si necesario)
+            if not solo_soc_final:
+                soc_full[idx_global] = soc_curr
+                temps_full[idx_global] = T_curr
+
+                idx_global += 1
+
+    # Calcular distancia total si no la tenemos (en modo solo_soc_final)
+    if solo_soc_final:
+        distancia_total = np.sum(v_ms_vuelta * dt) * n_vueltas
+        return {
+            'soc_final': soc_curr,
+            'distancia_total': distancia_total,
+            'umbral_final': acc_umbral
+        }
+    else:
+        distancia_total = distancia_full[-1]
 
     return {
         't_full': t_full,
@@ -1820,5 +1846,5 @@ def simular_modo_fijo(
         'r_pack_full': r_pack_full,
         'soc_final': soc_curr,
         'umbral_final': acc_umbral,
-        'distancia_total': distancia_acumulada
+        'distancia_total': distancia_total
     }
