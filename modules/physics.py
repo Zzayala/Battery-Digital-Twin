@@ -21,6 +21,55 @@ except ImportError:
 # =============================================================================
 
 @jit(nopython=True)
+def _calcular_resistencia_dinamica(r_base_ohm, soc, temp_c, current_a, t_pulso_s):
+    """
+    Calcula la resistencia instantánea dinámica.
+
+    Factores:
+    - SOC: "Bañera" (sube en <10% y >90%)
+    - Temp: Arrhenius (baja con T)
+    - Corriente: Butler-Volmer (baja con I)
+    - Tiempo: Polarización (sube con t_pulso)
+    """
+    # Evitar errores numéricos
+    if r_base_ohm < 1e-9: return 0.0
+
+    # --- 1. TÉRMINO BASE (SOC) ---
+    factor_soc = 1.0
+    if soc < 10.0:
+        val = (10.0 - soc) / 10.0
+        factor_soc = 1.0 + 0.5 * (val * val)
+    elif soc > 90.0:
+        val = (soc - 90.0) / 10.0
+        factor_soc = 1.0 + 0.2 * (val * val)
+
+    R_soc = r_base_ohm * factor_soc
+
+    # --- 2. TÉRMINO ARRHENIUS (TEMPERATURA) ---
+    # T_ref = 298.15 K (25°C)
+    # Ea_R ~ 1500.0 K
+    temp_k = temp_c + 273.15
+    # Clamp temp para evitar div/0 o valores locos
+    if temp_k < 200: temp_k = 200.0
+
+    factor_arrhenius = np.exp(1500.0 * (1.0/temp_k - 1.0/298.15))
+
+    # --- 3. TÉRMINO BUTLER-VOLMER (CORRIENTE) ---
+    # k1=0.15, k2=0.05
+    i_abs = abs(current_a)
+    factor_corriente = 1.0 - 0.15 * (1.0 - np.exp(-0.05 * i_abs))
+
+    # --- 4. TÉRMINO DINÁMICO (TIEMPO) ---
+    # tau=5.0s, k_pol=0.3
+    # Mantenemos el t_pulso controlado
+    factor_tiempo = 1.0 + 0.3 * (1.0 - np.exp(-t_pulso_s / 5.0))
+
+    # --- FINAL ---
+    R_total = R_soc * factor_arrhenius * factor_corriente * factor_tiempo
+
+    return R_total
+
+@jit(nopython=True)
 def _simular_soc_numba(
     P_elec_pack, 
     dt, 
@@ -35,7 +84,9 @@ def _simular_soc_numba(
     Núcleo de cálculo de evolución de SOC acelerado por Numba.
     No puede usar objetos ni diccionarios, solo arrays y escalares.
     """
+
     soc_actual = soc_inicial
+    min_soc_reached = 100.0
     
     # Pre-extraer coeffs para velocidad (suponemos polyval manual o np.polyval si numba lo soporta)
     # Numba soporta np.polyval parcialmente, pero mejor implementarlo inline para máxima compatibilidad
@@ -82,10 +133,397 @@ def _simular_soc_numba(
             soc_actual = soc_actual + d_soc
             
             # Clamp limits
-            if soc_actual < 0.0: soc_actual = 0.0
+            if soc_actual <= 0.0:
+                 soc_actual = 0.0
+                 min_soc_reached = 0.0
             if soc_actual > 100.0: soc_actual = 100.0
             
-    return soc_actual
+            if soc_actual < min_soc_reached:
+                min_soc_reached = soc_actual
+
+    return soc_actual, min_soc_reached
+
+
+@jit(nopython=True)
+def _simular_adaptativo_numba(
+    acc_telem, v_ms, dt, n_vueltas,
+    masa, F_aero, F_roll, eta,
+    I_cont, I_pico, t_pico_max,
+    V_pack_nom, n_s, n_p,
+    cap_pack_as, r_pack_ohm, r_operative_cell,
+    p_aux, P_regen_vector,
+    mu, rho, cl, area, dist_peso,
+    temp_amb, refrigeracion,
+    n_celdas_total, mass_pack_kg, cp,
+    soc_max, soc_min, soc_objetivo,
+    distancia_total,
+    umbral_inicial, margen_traccion,
+    ocv_coeffs
+):
+    """
+    Bucle principal de simulación adaptativa optimizado con Numba.
+    """
+    # Arrays de salida
+    n_puntos_vuelta = len(acc_telem)
+    n_puntos_total = n_puntos_vuelta * n_vueltas
+    t_vuelta = n_puntos_vuelta * dt
+
+    t_full = np.zeros(n_puntos_total)
+    soc_full = np.zeros(n_puntos_total)
+    temps_full = np.zeros(n_puntos_total)
+    umbral_full = np.zeros(n_puntos_total)
+    P_elec_full = np.zeros(n_puntos_total)
+    distancia_full = np.zeros(n_puntos_total)
+    r_pack_full = np.zeros(n_puntos_total)
+
+    # Estado inicial
+    soc_actual = soc_max
+    T_actual = temp_amb
+    umbral_actual = umbral_inicial
+    distancia_acumulada = 0.0
+    ultima_adaptacion_m = 0.0
+    tiempo_acum_pico = 0.0
+    error_prev = 0.0
+
+    # Estado dinámico para resistencia
+    i_pack_prev = 0.0
+    t_pulso = 0.0
+
+    # Constantes
+    UMBRAL_MIN = 0.0
+    UMBRAL_MAX = 13.0
+
+    # Márgenes eléctricos
+    I_cont_safe = I_cont * 0.95
+    I_pico_safe = I_pico * 0.95
+
+    idx_global = 0
+
+    for vuelta in range(n_vueltas):
+        for i in range(n_puntos_vuelta):
+            acc_i = acc_telem[i]
+            vel_i = v_ms[i]
+
+            # Actualizar distancia
+            distancia_acumulada += vel_i * dt
+
+            # ============================================
+            # CONTROL ADAPTATIVO (Cada 20 metros)
+            # ============================================
+            if distancia_acumulada - ultima_adaptacion_m >= 20.0:
+                ultima_adaptacion_m = distancia_acumulada
+
+                # Calcular ratios
+                distancia_restante = distancia_total - distancia_acumulada
+                soc_disponible = soc_actual - soc_objetivo
+                soc_inicial_disponible = soc_max - soc_objetivo
+
+                if distancia_restante > 0 and soc_inicial_disponible > 0:
+                    # Ratio de energía restante (0 = agotada, 1 = completa)
+                    ratio_energia = soc_disponible / soc_inicial_disponible
+                    if ratio_energia < 0: ratio_energia = 0.0
+
+                    # Ratio de carrera restante (0 = terminada, 1 = inicio)
+                    ratio_distancia = distancia_restante / distancia_total
+
+                    # Diferencia: positivo = sobra energía, negativo = falta energía
+                    diferencia = ratio_energia - ratio_distancia
+
+                    error_abs = abs(diferencia)
+
+                    # === LÓGICA DE DUAL-SPEED (Dos Velocidades) ===
+                    # K y ALPHA siguen siendo discretos para estabilidad
+
+                    # CÁLCULO INTELIGENTE DE SLEW_RATE (Velocidad de cambio)
+                    # Base 0.2 + Proporcional al error (x20) -> Tope 2.5
+                    SLEW_RATE_MAX = 0.2 + (15.0 * error_abs)
+                    if SLEW_RATE_MAX > 2.5: SLEW_RATE_MAX = 2.5
+
+                    # === ADAPTACIÓN CONTINUA (Infinitos Niveles) ===
+                    # K crece con el error para vencer la resistencia
+                    K_adaptacion = 0.5 + (55.0 * error_abs)
+                    if K_adaptacion > 6.0: K_adaptacion = 6.0
+
+                    # ALPHA crece con el error para reaccionar más rápido
+                    ALPHA_EMA = 0.9 + (6.0 * error_abs)
+                    if ALPHA_EMA > 0.95: ALPHA_EMA = 0.95
+
+                    # === PROTECCIÓN FINAL DE CARRERA (Asimétrica) ===
+                    if ratio_distancia < 0.10:
+                        if diferencia < -0.005:
+                            # MODO SUPERVIVENCIA: Nos falta energía al final -> Prioridad ABSOLUTA al SOC
+                            K_adaptacion = 3.0
+                            SLEW_RATE_MAX = 2.0
+                            ALPHA_EMA = 0.8
+                        else:
+                            # ATERRIZAJE SUAVE: Vamos bien -> Prioridad a la estabilidad
+                            K_adaptacion = 0.3
+                            SLEW_RATE_MAX = 0.3
+                            ALPHA_EMA = 0.1
+
+                    if ALPHA_EMA > 0:
+                        # Ajuste PD con FRENO DINÁMICO
+                        # Si hay mucho error, soltamos freno (3.0) para correr. Si hay poco, frenamos (12.0) para estabilizar.
+                        K_D = 30.0 - (200.0 * error_abs)
+                        if K_D < 3.0: K_D = 3.0
+
+                        delta_umbral_raw = - (diferencia * K_adaptacion + (diferencia - error_prev) * K_D)
+
+                        delta_umbral_limited = np.clip(delta_umbral_raw, -SLEW_RATE_MAX, SLEW_RATE_MAX)
+
+                        umbral_calculado = umbral_actual + delta_umbral_limited
+                        umbral_suavizado = ALPHA_EMA * umbral_calculado + (1.0 - ALPHA_EMA) * umbral_actual
+                        umbral_actual = np.clip(umbral_suavizado, UMBRAL_MIN, UMBRAL_MAX)
+
+                error_prev = diferencia # Update error_prev at the end of the adaptive block
+
+            # ============================================
+            # CÁLCULO DE POTENCIA
+            # ============================================
+            if acc_i <= umbral_actual:
+                # Zona de no-tracción
+                tiempo_acum_pico = tiempo_acum_pico - dt * 0.5
+                if tiempo_acum_pico < 0: tiempo_acum_pico = 0.0
+
+                if acc_i < 0:
+                    P_inst = -P_regen_vector[i] + p_aux
+                else:
+                    P_inst = p_aux
+            else:
+                # Zona de tracción
+                F_inert = masa * acc_i
+                F_tot = F_inert + F_aero[i] + F_roll
+                P_mech = F_tot * vel_i
+
+                if P_mech < 0: P_mech = 0.0
+
+                I_disp = I_cont_safe
+                if tiempo_acum_pico < t_pico_max:
+                    I_disp = I_pico_safe
+
+                P_bat_max = V_pack_nom * I_disp * n_p
+
+                F_down = 0.5 * rho * vel_i**2 * cl * area
+                Peso_front = masa * 9.81 * dist_peso
+                F_trac_max = (Peso_front + F_down * dist_peso) * mu
+                P_grip = (F_trac_max * vel_i) / eta * margen_traccion
+
+                P_dem = P_mech / eta
+
+                # min(P_dem, P_bat_max, P_grip)
+                P_real = P_dem
+                if P_bat_max < P_real: P_real = P_bat_max
+                if P_grip < P_real: P_real = P_grip
+
+                P_inst = P_real + p_aux
+
+                corriente_est = 0.0
+                if V_pack_nom > 0:
+                    corriente_est = P_real / V_pack_nom / n_p
+
+                if corriente_est > I_cont_safe:
+                    tiempo_acum_pico += dt
+                else:
+                    tiempo_acum_pico = tiempo_acum_pico - dt * 0.2
+                    if tiempo_acum_pico < 0: tiempo_acum_pico = 0.0
+
+            # ============================================
+            # MODELO ELÉCTRICO (SOC + Resistencia Dinámica)
+            # ============================================
+            v_cell_ocv = 0.0
+            for c in ocv_coeffs:
+                v_cell_ocv = v_cell_ocv * soc_actual + c
+
+            v_ocv_pack = v_cell_ocv * n_s
+
+            # --- Resistencia Dinámica ---
+            i_cell_prev = i_pack_prev / n_p
+            r_cell_dyn = _calcular_resistencia_dinamica(r_operative_cell, soc_actual, T_actual, i_cell_prev, t_pulso)
+            r_pack_dyn = (r_cell_dyn * n_s) / n_p
+
+            i_pack = 0.0
+            if abs(r_pack_dyn) < 1e-6:
+                if v_ocv_pack > 0:
+                    i_pack = P_inst / v_ocv_pack
+            else:
+                discr = v_ocv_pack**2 - 4 * r_pack_dyn * P_inst
+                if discr < 0:
+                    discr = 0.0
+                i_pack = (v_ocv_pack - np.sqrt(discr)) / (2 * r_pack_dyn)
+
+            # Gestión estado dinámico (Polarización)
+            if abs(i_pack) > 1.0:
+                t_pulso += dt
+            else:
+                t_pulso = max(0.0, t_pulso - dt * 2.0)
+
+            i_pack_prev = i_pack
+
+            d_soc = -(i_pack * dt) / cap_pack_as * 100.0
+            soc_actual = soc_actual + d_soc
+            if soc_actual < 0: soc_actual = 0.0
+            if soc_actual > 100: soc_actual = 100.0
+
+            # ============================================
+            # MODELO TÉRMICO
+            # ============================================
+            i_cell = i_pack / n_p
+            Q_gen_pack = n_celdas_total * (i_cell**2) * r_cell_dyn # Usar R dinámica
+            Q_out_pack = refrigeracion * (T_actual - temp_amb)
+            dT = ((Q_gen_pack - Q_out_pack) / (mass_pack_kg * cp)) * dt
+            T_actual += dT
+
+            # ============================================
+            # GUARDAR RESULTADOS
+            # ============================================
+            t_full[idx_global] = vuelta * t_vuelta + i * dt
+            soc_full[idx_global] = soc_actual
+            temps_full[idx_global] = T_actual
+            umbral_full[idx_global] = umbral_actual
+            P_elec_full[idx_global] = P_inst
+            distancia_full[idx_global] = distancia_acumulada
+            r_pack_full[idx_global] = r_pack_dyn
+
+            idx_global += 1
+
+    return t_full, soc_full, temps_full, umbral_full, P_elec_full, distancia_full, soc_actual, umbral_actual, r_pack_full
+
+
+@jit(nopython=True)
+def _f_ocv_poly_9_numba(soc, v_base_0, rango_base, v_min, rango_user):
+    """
+    Función OCV con polinomio de grado 9 y escalado lineal (Versión Numba).
+    Mantiene 100% de paridad con la versión de Python de alta fidelidad.
+    """
+    # Polinomio base
+    s = soc
+    if s < 0.0: s = 0.0
+    if s > 100.0: s = 100.0
+
+    # Horner's method or direct evaluation (optimized by LLVM)
+    v_raw = (2.17851508e-15 * s**9
+           - 1.06187295e-12 * s**8
+           + 2.19502650e-10 * s**7
+           - 2.50522387e-08 * s**6
+           + 1.72171213e-06 * s**5
+           - 7.29079506e-05 * s**4
+           + 1.87251524e-03 * s**3
+           - 2.77050498e-02 * s**2
+           + 2.18531709e-01 * s
+           + 2.75626590e+00)
+
+    # Escalado
+    v_norm = (v_raw - v_base_0) / rango_base
+    v_scaled = v_min + (v_norm * rango_user)
+
+    return v_scaled
+
+@jit(nopython=True)
+def _simular_fijo_numba(
+    P_elec_pack_vuelta, v_ms_vuelta, dt, n_vueltas,
+    soc_max,
+    cap_pack_as, n_s, n_p,
+    r_operative_cell_base,
+    temp_amb, refrigeracion,
+    mass_pack_kg, cp,
+    v_base_0, rango_base, v_min, rango_user, # OCV params
+    acc_umbral
+):
+    """
+    Versión compilada (Numba) de simular_modo_fijo.
+    """
+    n_puntos_vuelta = len(P_elec_pack_vuelta)
+    n_puntos_total = n_puntos_vuelta * n_vueltas
+
+    t_full = np.zeros(n_puntos_total)
+    soc_full = np.zeros(n_puntos_total)
+    temps_full = np.zeros(n_puntos_total)
+    umbral_full = np.zeros(n_puntos_total) # Se llenará con acc_umbral
+    P_elec_full = np.zeros(n_puntos_total)
+    distancia_full = np.zeros(n_puntos_total)
+    r_pack_full = np.zeros(n_puntos_total)
+
+    # Estado inicial
+    soc_curr = soc_max
+    T_curr = temp_amb
+    distancia_acumulada = 0.0
+
+    # Estado dinámico resistencia
+    i_pack_prev = 0.0
+    t_pulso = 0.0
+
+    idx_global = 0
+    t_ciclo = dt * n_puntos_vuelta
+    n_celdas_total = n_s * n_p
+
+    for vuelta in range(n_vueltas):
+        t_inicio_vuelta = vuelta * t_ciclo
+
+        for i in range(n_puntos_vuelta):
+            p_inst = P_elec_pack_vuelta[i]
+            vel_i = v_ms_vuelta[i]
+
+            # --- MODELO ELÉCTRICO ---
+            v_cell_ocv = _f_ocv_poly_9_numba(soc_curr, v_base_0, rango_base, v_min, rango_user)
+            v_ocv_pack = v_cell_ocv * n_s
+
+            # R Dinámica
+            i_cell_prev = i_pack_prev / n_p
+            r_cell_dyn = _calcular_resistencia_dinamica(
+                r_operative_cell_base,
+                soc_curr,
+                T_curr,
+                i_cell_prev,
+                t_pulso
+            )
+            r_pack_dyn = (r_cell_dyn * n_s) / n_p
+            r_pack_full[idx_global] = r_pack_dyn
+
+            i_pack = 0.0
+            if abs(r_pack_dyn) < 1e-6:
+                if v_ocv_pack > 0:
+                     i_pack = p_inst / v_ocv_pack
+            else:
+                discr = v_ocv_pack**2 - 4 * r_pack_dyn * p_inst
+                if discr < 0: discr = 0.0
+                i_pack = (v_ocv_pack - np.sqrt(discr)) / (2 * r_pack_dyn)
+
+            # Dinámica de tiempo (Polarización)
+            if abs(i_pack) > 1.0:
+                t_pulso += dt
+            else:
+                t_pulso = t_pulso - dt * 2.0
+                if t_pulso < 0.0: t_pulso = 0.0
+
+            i_pack_prev = i_pack
+
+            # Actualizar SOC
+            d_soc = -(i_pack * dt) / cap_pack_as * 100.0
+            soc_curr = soc_curr + d_soc
+            if soc_curr < 0.0: soc_curr = 0.0
+            if soc_curr > 100.0: soc_curr = 100.0
+
+            # --- MODELO TÉRMICO ---
+            i_cell = i_pack / n_p
+            Q_gen = n_celdas_total * (i_cell**2) * r_cell_dyn
+            Q_out = refrigeracion * (T_curr - temp_amb)
+            dT = ((Q_gen - Q_out) / (mass_pack_kg * cp)) * dt
+            T_curr += dT
+
+            # Actualizar Distancia
+            distancia_acumulada += vel_i * dt
+
+            # Guardar datos
+            t_full[idx_global] = t_inicio_vuelta + i * dt
+            soc_full[idx_global] = soc_curr
+            temps_full[idx_global] = T_curr
+            P_elec_full[idx_global] = p_inst
+            distancia_full[idx_global] = distancia_acumulada
+            umbral_full[idx_global] = acc_umbral
+
+            idx_global += 1
+
+    return t_full, soc_full, temps_full, umbral_full, P_elec_full, distancia_full, r_pack_full, soc_curr, acc_umbral, distancia_acumulada
 
 
 # =============================================================================
@@ -499,6 +937,13 @@ def obtener_funcion_ocv_polinomica(v_min, v_nom, v_max):
     # Adjuntamos al objeto funcion
     f_ocv_hibrida.coeffs = coeffs_approx
 
+    # Adjuntamos parámetros para Numba (reproducción exacta)
+    f_ocv_hibrida.v_base_0 = v_base_0
+    f_ocv_hibrida.v_base_100 = v_base_100
+    f_ocv_hibrida.rango_base = rango_base
+    f_ocv_hibrida.v_min = v_min
+    f_ocv_hibrida.rango_user = rango_user
+
     return f_ocv_hibrida
 
 
@@ -553,63 +998,87 @@ def generar_perfil_potencia_unificado(
     n_puntos = len(acc_telem)
     P_elec_pack = np.zeros(n_puntos)
     
-    tiempo_acum_pico = 0.0
-    
     # Márgenes de seguridad
     I_cont_safe = I_cont * 0.95
     I_pico_safe = I_pico * 0.95
     V_pack_nom = v_nom_est * n_s
+
+    # Máscaras
+    mask_traction = acc_telem > acc_umbral
+    mask_no_traction = ~mask_traction
     
-    for i in range(len(acc_telem)):
-        acc_i = acc_telem[i]
-        vel_i = v_ms[i]
-        
-        # 1. ZONA DE NO-TRACCIÓN (BAJO UMBRAL)
-        if acc_i <= acc_umbral:
-            # Enfriamos el fusible térmico virtual
-            tiempo_acum_pico = max(0, tiempo_acum_pico - dt * 0.5)
-            
-            # Aplicamos Regen (si frenada) o solo Auxiliar
-            if acc_i < 0:
-                P_elec_pack[i] = -P_regen_vector[i] + p_aux
-            else:
-                P_elec_pack[i] = p_aux
+    # --- 1. ZONA DE NO-TRACCIÓN (Vectorizado) ---
+    # Si acc < 0: -P_regen + p_aux, else: p_aux
+    if np.any(mask_no_traction):
+        P_elec_pack[mask_no_traction] = np.where(
+            acc_telem[mask_no_traction] < 0,
+            -P_regen_vector[mask_no_traction] + p_aux,
+            p_aux
+        )
+
+    # --- 2. PRE-CÁLCULO CANDIDATOS TRACCIÓN (Vectorizado) ---
+    # Vectorizamos todo el array para evitar slicing complejo y mantener claridad,
+    # asumiendo que el overhead de cálculo extra es menor que el de gestión.
+
+    F_inert = masa * acc_telem
+    F_tot = F_inert + F_aero + F_roll
+    P_mech = F_tot * v_ms
+
+    if activar_limite_motor:
+        P_max_mech = p_motor_max_kw * 1000.0
+        P_mech = np.minimum(P_mech, P_max_mech)
+
+    # Potencia demandada mecánica
+    P_dem = np.maximum(P_mech, 0) / eta
+
+    # Límite Grip
+    F_down = 0.5 * rho * v_ms**2 * cl * area
+    Peso_front = masa * 9.81 * dist_peso
+    F_trac_max = (Peso_front + F_down * dist_peso) * mu
+    P_grip = (F_trac_max * v_ms) / eta * margen_traccion
+
+    # Candidato sin límite de batería
+    P_candidate = np.minimum(P_dem, P_grip)
+
+    # --- 3. BUCLE DE ESTADO (Fusible Térmico) ---
+    # Iteramos para gestionar el tiempo_acum_pico y aplicar límite de batería
+    tiempo_acum_pico = 0.0
+
+    # Pre-calculamos límites de batería constantes
+    P_bat_max_pico = V_pack_nom * I_pico_safe * n_p
+    P_bat_max_cont = V_pack_nom * I_cont_safe * n_p
+
+    # Constantes para el bucle
+    dt_up = dt
+    dt_down_fast = dt * 0.5
+    dt_down_slow = dt * 0.2
+
+    # Bucle optimizado: lógica mínima necesaria
+    for i in range(n_puntos):
+        if not mask_traction[i]:
+            # No tracción: enfriamos rápido
+            if tiempo_acum_pico > 0:
+                tiempo_acum_pico = max(0, tiempo_acum_pico - dt_down_fast)
             continue
         
-        # 2. ZONA DE TRACCIÓN (SOBRE UMBRAL)
-        F_inert = masa * acc_i
-        F_tot = F_inert + F_aero[i] + F_roll
-        P_mech = F_tot * vel_i
+        # Tracción: determinamos límite batería según estado
+        P_bat_max = P_bat_max_pico if tiempo_acum_pico < t_pico_max else P_bat_max_cont
         
-        # Limitar Potencia Mecánica por Motor (si aplica)
-        if activar_limite_motor:
-             P_max_mech = p_motor_max_kw * 1000.0
-             P_mech = min(P_mech, P_max_mech)
+        # Seleccionamos potencia real
+        p_cand = P_candidate[i]
+        p_real = min(p_cand, P_bat_max)
         
-        # Límites Eléctricos Dinámicos
-        I_disp = I_pico_safe if tiempo_acum_pico < t_pico_max else I_cont_safe
-        P_bat_max = V_pack_nom * I_disp * n_p
+        P_elec_pack[i] = p_real + p_aux
         
-        # Límite Grip
-        F_down = 0.5 * rho * vel_i**2 * cl * area
-        Peso_front = masa * 9.81 * dist_peso
-        F_trac_max = (Peso_front + F_down * dist_peso) * mu
-        P_grip = (F_trac_max * vel_i) / eta * margen_traccion
-        
-        # Selección de Potencia Real
-        P_dem = P_mech / eta if P_mech > 0 else 0
-        P_real = min(P_dem, P_bat_max, P_grip)
-        
-        P_elec_pack[i] = P_real + p_aux
-        
-        # Gestión del tiempo de pico
-        v_ref_safe = V_pack_nom if V_pack_nom > 1.0 else 1.0
-        corriente_estimada = P_real / v_ref_safe / n_p
-        if corriente_estimada > I_cont_safe:
-            tiempo_acum_pico += dt
+        # Actualizamos estado térmico
+        # Condición: corriente_estimada > I_cont_safe
+        # Simplificación: P_real > P_bat_max_cont (asumiendo V nominal constante)
+        if p_real > P_bat_max_cont:
+             tiempo_acum_pico += dt_up
         else:
-            tiempo_acum_pico = max(0, tiempo_acum_pico - dt * 0.2)
-    
+             if tiempo_acum_pico > 0:
+                tiempo_acum_pico = max(0, tiempo_acum_pico - dt_down_slow)
+
     return P_elec_pack
 
 
@@ -630,7 +1099,11 @@ def calcular_soc_final_para_umbral(
     dt,
     margen_traccion=0.90,
     activar_limite_motor=False,
-    p_motor_max_kw=0.0
+    p_motor_max_kw=0.0,
+    temp_amb=25.0,
+    refrigeracion=20.0,
+    peso_celda_g=100.0,
+    **kwargs
 ):
     """
     Calcula el SOC final simulando con la curva OCV real.
@@ -659,37 +1132,25 @@ def calcular_soc_final_para_umbral(
         p_motor_max_kw=p_motor_max_kw
     )
     
-    # 3. Integración temporal (Acelerada con Numba si es posible)
-    # Extraer coeficientes del polinomio f_ocv para pasarlos a Numba
-    # f_ocv es un numpy.poly1d
-    ocv_coeffs = f_ocv.coeffs
-    
-    # Pre-cálculo de constantes
-    cap_pack_as = cap_celda * n_p * 3600.0
-    r_pack_ohm = (r_interna_mohm / 1000.0 * n_s) / n_p
-    
-    # Asegurar tipos float64 para numba
-    P_elec_pack = P_elec_pack.astype(np.float64)
-    dt = float(dt)
-    n_vueltas = int(n_vueltas)
-    soc_max = float(soc_max)
-    cap_pack_as = float(cap_pack_as)
-    r_pack_ohm = float(r_pack_ohm)
-    ocv_coeffs = ocv_coeffs.astype(np.float64)
-    n_s = float(n_s)
-
-    soc_actual = _simular_soc_numba(
-        P_elec_pack, 
-        dt, 
-        n_vueltas, 
-        soc_max,
-        cap_pack_as,
-        r_pack_ohm,
-        n_s, 
-        ocv_coeffs
+    # 3. Simulación completa (Térmica + Dinámica + Degradación)
+    resultado = simular_modo_fijo(
+        P_elec_pack_vuelta=P_elec_pack,
+        v_ms_vuelta=v_ms,
+        dt=dt,
+        n_vueltas=n_vueltas,
+        soc_max=soc_max,
+        cap_celda=cap_celda,
+        n_s=n_s,
+        n_p=n_p,
+        r_interna_mohm=r_interna_mohm,
+        temp_amb=temp_amb,
+        refrigeracion=refrigeracion,
+        peso_celda_g=peso_celda_g,
+        f_ocv=f_ocv,
+        acc_umbral=umbral_test
     )
-            
-    return soc_actual
+
+    return resultado['soc_final']
 
 
 # =============================================================================
@@ -792,7 +1253,6 @@ def simular_con_umbral_adaptativo(
     temp_amb, refrigeracion,
     peso_celda_g=100.0,
     umbral_inicial=4.0,
-    intervalo_adaptacion_m=50.0,
     margen_soc_final=0.5,
     margen_traccion=0.90
 ):
@@ -800,13 +1260,10 @@ def simular_con_umbral_adaptativo(
     Simulación completa con CONTROL ADAPTATIVO del umbral de aceleración.
     ...
     """
-    # Constantes
-    UMBRAL_MIN = 0.0
-    UMBRAL_MAX = 13.0
-    UMBRAL_MAX = 13.0
-    
     # Preparación
     f_ocv = obtener_funcion_ocv_polinomica(v_min_celda, v_nom_celda, v_max_celda)
+    ocv_coeffs = f_ocv.coeffs.astype(np.float64)
+
     r_operative_cell = (r_interna_mohm / 1000.0)
     r_pack_ohm = (r_interna_mohm / 1000.0 * n_s) / n_p
     cap_pack_as = cap_celda * n_p * 3600.0
@@ -819,21 +1276,107 @@ def simular_con_umbral_adaptativo(
     # SOC objetivo (mínimo + margen)
     soc_objetivo = soc_min + margen_soc_final
     
-    # Márgenes eléctricos
-    I_cont_safe = I_cont * 0.95
-    I_pico_safe = I_pico * 0.95
+    # Constantes térmicas (MODELO DE PACK COMPLETO)
+    n_celdas_total = n_s * n_p
+    mass_celda_kg = peso_celda_g / 1000.0
+    mass_pack_kg = mass_celda_kg * n_celdas_total
+    cp = 1000.0  # J/(kg·K) - Calor específico de celdas LiPo
     
+    # Casteo a float64 para Numba (seguridad extra)
+    dt = float(dt)
+    n_vueltas = int(n_vueltas)
+    masa = float(masa)
+    F_roll = float(F_roll)
+    eta = float(eta)
+    I_cont = float(I_cont)
+    I_pico = float(I_pico)
+    t_pico_max = float(t_pico_max)
+    V_pack_nom = float(V_pack_nom)
+    cap_pack_as = float(cap_pack_as)
+    r_pack_ohm = float(r_pack_ohm)
+    r_operative_cell = float(r_operative_cell)
+    p_aux = float(p_aux)
+    mu = float(mu)
+    rho = float(rho)
+    cl = float(cl)
+    area = float(area)
+    dist_peso = float(dist_peso)
+    temp_amb = float(temp_amb)
+    refrigeracion = float(refrigeracion)
+    soc_max = float(soc_max)
+    soc_min = float(soc_min)
+    soc_objetivo = float(soc_objetivo)
+    distancia_total = float(distancia_total)
+    umbral_inicial = float(umbral_inicial)
+    margen_traccion = float(margen_traccion)
+    n_s = float(n_s)
+    n_p = float(n_p)
+    n_celdas_total = float(n_celdas_total)
+    mass_pack_kg = float(mass_pack_kg)
+
+    if NUMBA_AVAILABLE:
+        # === EJECUCIÓN CON NUMBA (RÁPIDA) ===
+        try:
+           t_full, soc_full, temps_full, umbral_full, P_elec_full, distancia_full, soc_final, umbral_final, r_pack_full = _simular_adaptativo_numba(
+                acc_telem, v_ms, float(dt), int(n_vueltas),
+                float(masa), F_aero, F_roll, eta,
+                float(I_cont), float(I_pico), float(t_pico_max),
+                float(V_pack_nom), float(n_s), float(n_p),
+                float(cap_pack_as), float(r_pack_ohm), float(r_operative_cell),
+                float(p_aux), P_regen_vector,
+                float(mu), float(rho), float(cl), float(area), float(dist_peso),
+                float(temp_amb), float(refrigeracion),
+                float(n_celdas_total), float(mass_pack_kg), float(cp),
+                float(soc_max), float(soc_min), float(soc_objetivo),
+                float(distancia_total),
+                float(umbral_inicial), float(margen_traccion),
+                ocv_coeffs
+            )
+
+           return {
+                't_full': t_full,
+                'soc_full': soc_full,
+                'temps_full': temps_full,
+                'umbral_full': umbral_full,
+                'P_elec_full': P_elec_full,
+                'distancia_full': distancia_full,
+                'umbral_final': umbral_final,
+                'r_pack_full': r_pack_full,
+                'soc_final': soc_final,
+                'distancia_total': distancia_total
+            }
+        except Exception as e:
+             # Si falla Numba, pasamos a fallback silenciosamente
+             pass
+
+    # === EJECUCIÓN PYTHON PURO (LENTA - FALLBACK) ===
+    # Esta parte se ejecuta si Numba no está disponible o falló
+    return _simular_adaptativo_python_legacy(
+        acc_telem, v_ms, dt, n_vueltas, masa, F_aero, F_roll, eta, I_cont, I_pico, t_pico_max,
+        V_pack_nom, n_s, n_p, cap_pack_as, r_pack_ohm, r_operative_cell, p_aux, P_regen_vector,
+        mu, rho, cl, area, dist_peso, temp_amb, refrigeracion, n_celdas_total, mass_pack_kg, cp,
+        soc_max, soc_min, soc_objetivo, distancia_total, umbral_inicial, margen_traccion, ocv_coeffs
+    )
+
+def _simular_adaptativo_python_legacy(
+    acc_telem, v_ms, dt, n_vueltas, masa, F_aero, F_roll, eta, I_cont, I_pico, t_pico_max,
+    V_pack_nom, n_s, n_p, cap_pack_as, r_pack_ohm, r_operative_cell, p_aux, P_regen_vector,
+    mu, rho, cl, area, dist_peso, temp_amb, refrigeracion, n_celdas_total, mass_pack_kg, cp,
+    soc_max, soc_min, soc_objetivo, distancia_total, umbral_inicial, margen_traccion, ocv_coeffs
+):
+    """Versión Legacy en Python (lenta) para cuando Numba no esta disponible."""
     # Arrays de salida
     n_puntos_vuelta = len(acc_telem)
     n_puntos_total = n_puntos_vuelta * n_vueltas
-    
     t_vuelta = n_puntos_vuelta * dt
+
     t_full = np.zeros(n_puntos_total)
     soc_full = np.zeros(n_puntos_total)
     temps_full = np.zeros(n_puntos_total)
     umbral_full = np.zeros(n_puntos_total)
     P_elec_full = np.zeros(n_puntos_total)
     distancia_full = np.zeros(n_puntos_total)
+    r_pack_full = np.zeros(n_puntos_total)
     
     # Estado inicial
     soc_actual = soc_max
@@ -842,13 +1385,17 @@ def simular_con_umbral_adaptativo(
     distancia_acumulada = 0.0
     ultima_adaptacion_m = 0.0
     tiempo_acum_pico = 0.0
+    error_prev = 0.0
     
-    # Constantes térmicas (MODELO DE PACK COMPLETO)
-    n_celdas_total = n_s * n_p
-    mass_celda_kg = peso_celda_g / 1000.0
-    mass_pack_kg = mass_celda_kg * n_celdas_total
-    cp = 1000  # J/(kg·K) - Calor específico de celdas LiPo
-    r_operative_cell = (r_interna_mohm / 1000.0)
+    # Estado dinámico resistencia
+    i_pack_prev = 0.0
+    t_pulso = 0.0
+
+    # Constantes
+    UMBRAL_MIN = 0.0
+    UMBRAL_MAX = 13.0
+    I_cont_safe = I_cont * 0.95
+    I_pico_safe = I_pico * 0.95
     
     idx_global = 0
     
@@ -857,124 +1404,128 @@ def simular_con_umbral_adaptativo(
             acc_i = acc_telem[i]
             vel_i = v_ms[i]
             
-            # Actualizar distancia
+            # --- Lógica Adaptativa (Igual que Numba) ---
             distancia_acumulada += vel_i * dt
-            
-            # ============================================
-            # CONTROL ADAPTATIVO (cada intervalo_adaptacion_m metros)
-            # ============================================
-            if distancia_acumulada - ultima_adaptacion_m >= intervalo_adaptacion_m:
+            if distancia_acumulada - ultima_adaptacion_m >= 20.0:
                 ultima_adaptacion_m = distancia_acumulada
-                
-                # Calcular ratios
                 distancia_restante = distancia_total - distancia_acumulada
                 soc_disponible = soc_actual - soc_objetivo
                 soc_inicial_disponible = soc_max - soc_objetivo
                 
                 if distancia_restante > 0 and soc_inicial_disponible > 0:
-                    # Ratio de energía restante (0 = agotada, 1 = completa)
-                    ratio_energia = max(0, soc_disponible / soc_inicial_disponible)
-                    # Ratio de carrera restante (0 = terminada, 1 = inicio)
+                    ratio_energia = max(0.0, soc_disponible / soc_inicial_disponible)
                     ratio_distancia = distancia_restante / distancia_total
-                    
-                    # Diferencia: positivo = sobra energía, negativo = falta energía
                     diferencia = ratio_energia - ratio_distancia
                     
-                    # Ajuste proporcional del umbral
-                    # diferencia > 0: sobra energía → bajar umbral (más agresivo)
-                    # diferencia < 0: falta energía → subir umbral (más conservador)
-                    K_adaptacion = 0.7  # Ganancia del controlador (reducida)
-                    delta_umbral_raw = -diferencia * K_adaptacion
+                    error_abs = abs(diferencia)
                     
-                    # === SLEW RATE LIMITER ===
-                    # Limitar cambio máximo por actualización a ±0.5 m/s²
-                    SLEW_RATE_MAX = 0.5  # m/s² por intervalo
-                    delta_umbral_limited = np.clip(delta_umbral_raw, -SLEW_RATE_MAX, SLEW_RATE_MAX)
+                    # CÁLCULO INTELIGENTE DE SLEW_RATE
+                    SLEW_RATE_MAX = 0.2 + (20.0 * error_abs)
+                    if SLEW_RATE_MAX > 2.5: SLEW_RATE_MAX = 2.5
                     
-                    # === FILTRO EMA (Media Móvil Exponencial) ===
-                    # Suaviza la transición: nuevo = α×calculado + (1-α)×anterior
-                    ALPHA_EMA = 0.3  # Factor de suavizado (0.3 = 30% nuevo, 70% anterior)
-                    umbral_calculado = umbral_actual + delta_umbral_limited
-                    umbral_suavizado = ALPHA_EMA * umbral_calculado + (1 - ALPHA_EMA) * umbral_actual
+                    # === ADAPTACIÓN CONTINUA (Infinitos Niveles) ===
+                    K_adaptacion = 0.4 + (45.0 * error_abs)
+                    if K_adaptacion > 6.0: K_adaptacion = 6.0
                     
-                    umbral_actual = np.clip(umbral_suavizado, UMBRAL_MIN, UMBRAL_MAX)
+                    ALPHA_EMA = 0.5 + (4.0 * error_abs)
+                    if ALPHA_EMA > 0.95: ALPHA_EMA = 0.95
+
+                    # Protección final (Asimétrica)
+                    if ratio_distancia < 0.10:
+                        if diferencia < -0.005:
+                            # MODO SUPERVIVENCIA
+                            K_adaptacion = 3.0
+                            SLEW_RATE_MAX = 2.0
+                            ALPHA_EMA = 0.8
+                        else:
+                            # ATERRIZAJE SUAVE
+                            K_adaptacion = 0.3
+                            SLEW_RATE_MAX = 0.3
+                            ALPHA_EMA = 0.1
+
+                    if ALPHA_EMA > 0:
+                        # Ajuste PD Adaptativo Inverso
+                        K_D = 12.0 - (100.0 * error_abs)
+                        if K_D < 3.0: K_D = 3.0
+
+                        delta_umbral_raw = - (diferencia * K_adaptacion + (diferencia - error_prev) * K_D)
+
+                        delta_umbral_limited = np.clip(delta_umbral_raw, -SLEW_RATE_MAX, SLEW_RATE_MAX)
+
+                        umbral_calculado = umbral_actual + delta_umbral_limited
+                        umbral_suavizado = ALPHA_EMA * umbral_calculado + (1.0 - ALPHA_EMA) * umbral_actual
+                        umbral_actual = np.clip(umbral_suavizado, UMBRAL_MIN, UMBRAL_MAX)
+
+                error_prev = diferencia
             
-            # ============================================
-            # CÁLCULO DE POTENCIA (igual que antes)
-            # ============================================
+            # --- Cálculo Potencia ---
             if acc_i <= umbral_actual:
-                # Zona de no-tracción
-                tiempo_acum_pico = max(0, tiempo_acum_pico - dt * 0.5)
-                if acc_i < 0:
-                    P_inst = -P_regen_vector[i] + p_aux
-                else:
-                    P_inst = p_aux
+                tiempo_acum_pico = max(0.0, tiempo_acum_pico - dt * 0.5)
+                P_inst = (-P_regen_vector[i] + p_aux) if acc_i < 0 else p_aux
             else:
-                # Zona de tracción
                 F_inert = masa * acc_i
-                F_tot = F_inert + F_aero[i] + F_roll
-                P_mech = F_tot * vel_i
+                P_mech = (F_inert + F_aero[i] + F_roll) * vel_i
+                if P_mech < 0: P_mech = 0.0
                 
                 I_disp = I_pico_safe if tiempo_acum_pico < t_pico_max else I_cont_safe
                 P_bat_max = V_pack_nom * I_disp * n_p
                 
                 F_down = 0.5 * rho * vel_i**2 * cl * area
-                Peso_front = masa * 9.81 * dist_peso
-                F_trac_max = (Peso_front + F_down * dist_peso) * mu
+                F_trac_max = ((masa * 9.81 * dist_peso) + F_down * dist_peso) * mu
                 P_grip = (F_trac_max * vel_i) / eta * margen_traccion
                 
-                P_dem = P_mech / eta if P_mech > 0 else 0
+                P_dem = P_mech / eta
                 P_real = min(P_dem, P_bat_max, P_grip)
                 P_inst = P_real + p_aux
                 
-                corriente_est = P_real / V_pack_nom / n_p if V_pack_nom > 0 else 0
-                if corriente_est > I_cont_safe:
+                if (P_real / V_pack_nom / n_p) > I_cont_safe:
                     tiempo_acum_pico += dt
                 else:
-                    tiempo_acum_pico = max(0, tiempo_acum_pico - dt * 0.2)
+                    tiempo_acum_pico = max(0.0, tiempo_acum_pico - dt * 0.2)
             
-            # ============================================
-            # MODELO ELÉCTRICO (SOC)
-            # ============================================
-            v_ocv_pack = f_ocv(soc_actual) * n_s
+            # --- Modelo Eléctrico ---
+            v_cell_ocv = 0.0
+            for c in ocv_coeffs: v_cell_ocv = v_cell_ocv * soc_actual + c
+            v_ocv_pack = v_cell_ocv * n_s
+
+            # Resistencia Dinámica
+            i_cell_prev = i_pack_prev / n_p
+            r_cell_dyn = _calcular_resistencia_dinamica(r_operative_cell, soc_actual, T_actual, i_cell_prev, t_pulso)
+            r_pack_dyn = (r_cell_dyn * n_s) / n_p
             
-            if abs(r_pack_ohm) < 1e-6:
-                i_pack = P_inst / v_ocv_pack if v_ocv_pack > 0 else 0
+            if abs(r_pack_dyn) < 1e-6:
+                i_pack = P_inst / v_ocv_pack if v_ocv_pack > 0 else 0.0
             else:
-                discr = v_ocv_pack**2 - 4 * r_pack_ohm * P_inst
-                if discr < 0:
-                    discr = 0
-                i_pack = (v_ocv_pack - np.sqrt(discr)) / (2 * r_pack_ohm)
+                discr = v_ocv_pack**2 - 4 * r_pack_dyn * P_inst
+                i_pack = (v_ocv_pack - np.sqrt(max(0.0, discr))) / (2 * r_pack_dyn)
             
-            d_soc = -(i_pack * dt) / cap_pack_as * 100.0
-            soc_actual = np.clip(soc_actual + d_soc, 0, 100)
+            # Polarización
+            if abs(i_pack) > 1.0:
+                t_pulso += dt
+            else:
+                t_pulso = max(0.0, t_pulso - dt * 2.0)
             
-            # ============================================
-            # MODELO TÉRMICO (Pack completo)
-            # ============================================
+            i_pack_prev = i_pack
+            
+            soc_actual = np.clip(soc_actual - (i_pack * dt / cap_pack_as * 100.0), 0.0, 100.0)
+            
+            # --- Modelo Térmico ---
             i_cell = i_pack / n_p
-            # Calor generado: todas las celdas contribuyen (pérdidas Joule)
-            Q_gen_pack = n_celdas_total * (i_cell**2) * r_operative_cell  # [W]
+            Q_gen_pack = n_celdas_total * (i_cell**2) * r_cell_dyn
+            Q_out_pack = refrigeracion * (T_actual - temp_amb)
+            T_actual += ((Q_gen_pack - Q_out_pack) / (mass_pack_kg * cp)) * dt
             
-            # Calor disipado: capacidad total del sistema de refrigeración
-            Q_out_pack = refrigeracion * (T_actual - temp_amb)  # [W]
-            
-            # Variación de temperatura: masa del pack completo
-            dT = ((Q_gen_pack - Q_out_pack) / (mass_pack_kg * cp)) * dt  # [°C]
-            T_actual += dT
-            
-            # ============================================
-            # GUARDAR RESULTADOS
-            # ============================================
-            t_full[idx_global] = vuelta * t_vuelta + i * dt
+            # Guardar
+            t_full[idx_global] = idx_global * dt # Aprox
             soc_full[idx_global] = soc_actual
             temps_full[idx_global] = T_actual
             umbral_full[idx_global] = umbral_actual
             P_elec_full[idx_global] = P_inst
             distancia_full[idx_global] = distancia_acumulada
+            r_pack_full[idx_global] = r_pack_dyn
             
             idx_global += 1
-    
+
     return {
         't_full': t_full,
         'soc_full': soc_full,
@@ -982,8 +1533,9 @@ def simular_con_umbral_adaptativo(
         'umbral_full': umbral_full,
         'P_elec_full': P_elec_full,
         'distancia_full': distancia_full,
-        'soc_final': soc_actual,
         'umbral_final': umbral_actual,
+        'r_pack_full': r_pack_full,
+        'soc_final': soc_actual,
         'distancia_total': distancia_total
     }
 
@@ -1016,17 +1568,52 @@ def simular_modo_fijo(
         dict: Resultados completos (t_full, soc_full, etc.)
     """
     # Constantes
-    FACTOR_R_TRANSITORIO = 1.25
     cp = 1000  # J/(kg·K) - Calor específico
 
     # Preparación de parámetros
-    r_operative_cell = (r_interna_mohm / 1000.0) * FACTOR_R_TRANSITORIO
-    r_pack_ohm = (r_operative_cell * n_s) / n_p
+    r_operative_cell_base = (r_interna_mohm / 1000.0)
     cap_pack_as = cap_celda * n_p * 3600.0
     
     n_celdas_total = n_s * n_p
     mass_pack_kg = (peso_celda_g / 1000.0) * n_celdas_total
 
+    # === INTENTO DE EJECUCIÓN CON NUMBA (OPTIMIZADO) ===
+    if NUMBA_AVAILABLE and hasattr(f_ocv, 'v_base_0'):
+        try:
+            # Casteo explícito
+            P_elec_pack_vuelta_arr = np.ascontiguousarray(P_elec_pack_vuelta, dtype=np.float64)
+            v_ms_vuelta_arr = np.ascontiguousarray(v_ms_vuelta, dtype=np.float64)
+
+            t_f, s_f, T_f, u_f, P_f, d_f, r_f, s_end, u_end, d_tot = _simular_fijo_numba(
+                P_elec_pack_vuelta_arr, v_ms_vuelta_arr,
+                float(dt), int(n_vueltas),
+                float(soc_max),
+                float(cap_pack_as), float(n_s), float(n_p),
+                float(r_operative_cell_base),
+                float(temp_amb), float(refrigeracion),
+                float(mass_pack_kg), float(cp),
+                float(f_ocv.v_base_0), float(f_ocv.rango_base),
+                float(f_ocv.v_min), float(f_ocv.rango_user),
+                float(acc_umbral)
+            )
+
+            return {
+                't_full': t_f,
+                'soc_full': s_f,
+                'temps_full': T_f,
+                'umbral_full': u_f,
+                'P_elec_full': P_f,
+                'distancia_full': d_f,
+                'r_pack_full': r_f,
+                'soc_final': s_end,
+                'umbral_final': u_end,
+                'distancia_total': d_tot
+            }
+        except Exception:
+            # Si falla (ej. tipos incompatibles), caemos al modo legacy silenciosamente
+            pass
+
+    # === FALLBACK: EJECUCIÓN PYTHON PURO (LEGACY) ===
     # Arrays de salida
     n_puntos_vuelta = len(P_elec_pack_vuelta)
     n_puntos_total = n_puntos_vuelta * n_vueltas
@@ -1037,12 +1624,17 @@ def simular_modo_fijo(
     umbral_full = np.full(n_puntos_total, acc_umbral)
     P_elec_full = np.zeros(n_puntos_total)
     distancia_full = np.zeros(n_puntos_total)
+    r_pack_full = np.zeros(n_puntos_total)
 
     # Estado inicial
     soc_curr = soc_max
     T_curr = temp_amb
     distancia_acumulada = 0.0
     
+    # Estado dinámico
+    i_pack_prev = 0.0
+    t_pulso = 0.0
+
     idx_global = 0
     t_ciclo = dt * n_puntos_vuelta  # Duración aproximada de una vuelta para la base de tiempo
 
@@ -1054,14 +1646,35 @@ def simular_modo_fijo(
             vel_i = v_ms_vuelta[i]
             
             # --- MODELO ELÉCTRICO ---
+            # --- MODELO ELÉCTRICO ---
             v_ocv_pack = f_ocv(soc_curr) * n_s
+
+            # R Dinámica
+            i_cell_prev = i_pack_prev / n_p
+            r_cell_dyn = _calcular_resistencia_dinamica(
+                r_operative_cell_base,
+                soc_curr,
+                T_curr,
+                i_cell_prev,
+                t_pulso
+            )
+            r_pack_dyn = (r_cell_dyn * n_s) / n_p
+            r_pack_full[idx_global] = r_pack_dyn
             
-            if abs(r_pack_ohm) < 1e-6:
+            if abs(r_pack_dyn) < 1e-6:
                 i_pack = p_inst / v_ocv_pack if v_ocv_pack > 0 else 0
             else:
-                discr = v_ocv_pack**2 - 4 * r_pack_ohm * p_inst
+                discr = v_ocv_pack**2 - 4 * r_pack_dyn * p_inst
                 if discr < 0: discr = 0
-                i_pack = (v_ocv_pack - np.sqrt(discr)) / (2 * r_pack_ohm)
+                i_pack = (v_ocv_pack - np.sqrt(discr)) / (2 * r_pack_dyn)
+
+            # Dinámica de tiempo (Polarización)
+            if abs(i_pack) > 1.0:
+                t_pulso += dt
+            else:
+                t_pulso = max(0.0, t_pulso - dt * 2.0)
+
+            i_pack_prev = i_pack
             
             # Actualizar SOC
             d_soc = -(i_pack * dt) / cap_pack_as * 100.0
@@ -1069,7 +1682,7 @@ def simular_modo_fijo(
             
             # --- MODELO TÉRMICO ---
             i_cell = i_pack / n_p
-            Q_gen = n_celdas_total * (i_cell**2) * r_operative_cell
+            Q_gen = n_celdas_total * (i_cell**2) * r_cell_dyn
             Q_out = refrigeracion * (T_curr - temp_amb)
             dT = ((Q_gen - Q_out) / (mass_pack_kg * cp)) * dt
             T_curr += dT
@@ -1093,6 +1706,7 @@ def simular_modo_fijo(
         'umbral_full': umbral_full,
         'P_elec_full': P_elec_full,
         'distancia_full': distancia_full,
+        'r_pack_full': r_pack_full,
         'soc_final': soc_curr,
         'umbral_final': acc_umbral,
         'distancia_total': distancia_acumulada
