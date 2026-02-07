@@ -18,4 +18,4 @@ matplotlib>=3.7.0
 pandas>=2.0.0
 
 # --- Opcional: Aceleración (descomentar si se usa Numba) ---
-# numba>=0.57.0
+numba>=0.57.0
