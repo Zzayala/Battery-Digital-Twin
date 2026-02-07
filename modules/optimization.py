@@ -43,9 +43,10 @@ def buscar_umbral_optimo(soc_minimo, acc_telem, v_ms, n_vueltas, params):
     UMBRAL_MINIMO = 0.0
     UMBRAL_MAXIMO = 13.0
     
-    # Rango objetivo: [SOC_Min, SOC_Min + 2%]
-    soc_target_min = soc_minimo
-    soc_target_max = soc_minimo + 2.0
+    # Rango objetivo: [SOC_Min + 1%, SOC_Min + 2%]
+    # Ajuste según nuevo requerimiento: soc_min es límite duro. Buscamos dejar un margen de seguridad.
+    soc_target_min = soc_minimo + 1.5
+    soc_target_max = soc_minimo + 2.5
     
     # Log para debug
     log_pruebas = []
@@ -58,6 +59,7 @@ def buscar_umbral_optimo(soc_minimo, acc_telem, v_ms, n_vueltas, params):
     )
     # Si gastando al máximo cumplimos el mínimo (nos sobra o estamos justo), el 0.0 es el óptimo (máx performance)
     if soc_con_umbral_min >= soc_target_min:
+         log_pruebas.append({'iter': 0, 'umbral': UMBRAL_MINIMO, 'soc': round(soc_con_umbral_min, 2), 'decision': 'OPTIMO_DIRECTO_MIN'})
          return UMBRAL_MINIMO, soc_con_umbral_min, log_pruebas
     
     # Caso B: ¿Qué pasa si NO ayudamos NUNCA (Umbral 13)? (Mínimo consumo posible)
@@ -67,6 +69,7 @@ def buscar_umbral_optimo(soc_minimo, acc_telem, v_ms, n_vueltas, params):
     
     # Caso C: Si ahorrando al máximo no llegamos al mínimo -> Devolver MAX (Mejor esfuerzo para sobrevivir)
     if soc_con_umbral_max < soc_target_min:
+         log_pruebas.append({'iter': 0, 'umbral': UMBRAL_MAXIMO, 'soc': round(soc_con_umbral_max, 2), 'decision': 'FALLO_COBERTURA_MAX'})
          return UMBRAL_MAXIMO, soc_con_umbral_max, log_pruebas
     
     # --- 2. Bisección con Rastreo del Mejor Válido ---
@@ -76,10 +79,32 @@ def buscar_umbral_optimo(soc_minimo, acc_telem, v_ms, n_vueltas, params):
     mejor_soc = soc_con_umbral_max
     
     umbral_bajo, umbral_alto = UMBRAL_MINIMO, UMBRAL_MAXIMO
-    max_iter = 20 # Iteraciones suficientes para precisión
+    max_iter = 25
+
+    # Variables para control de repetición (Regla de los 3 strikes)
+    ultimo_umbral_probado = -1.0
+    contador_repeticiones = 0
+
+    # Tolerancia de convergencia alineada con el paso del slider (0.01)
+    TOLERANCIA = 0.01 # Más fina para evitar estancamiento prematuro, el bucle saldrá por iteraciones si oscila
     
     for i in range(max_iter):
-        umbral_test = (umbral_bajo + umbral_alto) / 2.0
+        # Calculamos el punto medio matemático
+        mid_point = (umbral_bajo + umbral_alto) / 2.0
+
+        # REGLA USUARIO: Solo probar valores con 2 decimales
+        umbral_test = round(mid_point, 2)
+
+        # Chequeo de repetición (si sale 3 veces el mismo número redondeado, paramos)
+        if umbral_test == ultimo_umbral_probado:
+            contador_repeticiones += 1
+        else:
+            contador_repeticiones = 1 # Reiniciar
+            ultimo_umbral_probado = umbral_test
+
+        if contador_repeticiones >= 3:
+            # Ya estamos dando vueltas sobre el mismo valor redondeado
+            break
         soc_final = calcular_soc_final_para_umbral(
             umbral_test, acc_telem, v_ms, n_vueltas, **params
         )
@@ -90,40 +115,58 @@ def buscar_umbral_optimo(soc_minimo, acc_telem, v_ms, n_vueltas, params):
         # Analizar resultado
         if soc_target_min <= soc_final <= soc_target_max:
             # ¡Dimos en el clavo! (Ventana perfecta)
-            return round(umbral_test, 2), soc_final, log_pruebas
+            # ANTES: return round(umbral_test, 2), soc_final, log_pruebas
+            # AHORA: Seguimos iterando para buscar el umbral más bajo posible dentro de la ventana
+            decision = 'DENTRO_RANGO_REFINAR'
+            es_valido = True
+            # Como queremos el umbral MÁS BAJO posible, tratamos esto como si fuera un "Exceso" (podemos gastar más)
+            # Así forzamos al algoritmo a probar umbrales más bajos.
+            umbral_alto = umbral_test
             
         elif soc_final < soc_target_min:
-            # DEFICIT: Nos falta batería -> Consumo Excesivo -> SUBIR Umbral
+            # DEFICIT: Nos falta batería -> Consumo Excesivo -> SUBIR Umbral (Ayudar menos)
+            # El óptimo debe estar entre [umbral_test, umbral_alto]
             umbral_bajo = umbral_test
             decision = 'DEFICIT_SUBIR'
-            es_valido = False # Este umbral rompe la restricción de SOC mínimo
+            es_valido = False
             
         else: # soc_final > soc_target_max
-            # EXCESO: Nos sobra batería -> Consumo Bajo -> BAJAR Umbral
+            # EXCESO: Nos sobra batería -> Consumo Bajo -> BAJAR Umbral (Ayudar más)
+            # El óptimo debe estar entre [umbral_bajo, umbral_test]
             umbral_alto = umbral_test
             decision = 'EXCESO_BAJAR'
-            es_valido = True # Cumple SOC >= Min, es un candidato válido
+            es_valido = True
         
-        # Actualizar "Mejor Candidato" si es válido y menor (más agresivo) que el anterior
-        # Nota: En la lógica de EXCESO_BAJAR, siempre vamos hacia umbrales menores.
-        # Si es válido, este umbral_test es mejor (más bajo) que el mejor_umbral anterior (que venía de arriba).
+        # Actualizar "Mejor Candidato Válido"
+        # Queremos el umbral más BAJO (más agresivo) posible que cumpla soc >= soc_min
+        # Si este intento es válido (nos sobra batería) y es menor que el mejor conocido, lo guardamos.
+        # Nota: Al ir por la rama de EXCESO, estamos bajando el umbral.
+        # Si soc_final > target, significa que aún podríamos bajar más (quizás).
+        # Guardamos este como "seguro" por si el siguiente paso se pasa de rosca.
         if es_valido:
-            mejor_umbral = umbral_test
-            mejor_soc = soc_final
+            if umbral_test < mejor_umbral:
+                mejor_umbral = umbral_test
+                mejor_soc = soc_final
         
         log_pruebas.append({
             'iter': i + 1, 
-            'umbral': round(umbral_test, 2),
+            'umbral': umbral_test, # Ya está redondeado a 2
             'soc': round(soc_final, 2),
             'decision': decision
         })
         
         # Tolerancia de convergencia
-        if (umbral_alto - umbral_bajo) < 0.05:
-            break
+        # ELIMINADO: Se fuerza a correr todas las iteraciones para refinar al máximo
+        # if (umbral_alto - umbral_bajo) < TOLERANCIA:
+        #    break
             
-    # Si salimos del bucle sin "EXITO" exacto, devolvemos el MEJOR VALIDO encontrado
-    # Esto garantiza que nunca devolvemos un umbral que deje tirado al coche (SOC < Min)
+    # Si salimos del bucle devuelve el MEJOR VÁLIDO encontrado.
+    log_pruebas.append({
+        'iter': 'FINAL',
+        'umbral': round(mejor_umbral, 2),
+        'soc': round(mejor_soc, 2),
+        'decision': 'SELECCIONADO_OPTIMO (O mejor seguro)'
+    })
     return round(mejor_umbral, 2), mejor_soc, log_pruebas
 
 
@@ -138,6 +181,7 @@ def preparar_parametros_optimizacion(
     masa_vehiculo, F_aero, F_roll, eta_total,
     p_media_aux_w, dt_sim, P_bat_input,
     cl, area, dist_peso,
+    temp_amb, refrigeracion, peso_celda_g, # Thermal params
     activar_limite_motor=False,
     p_motor_max_kw=0.0
 ):
@@ -151,6 +195,7 @@ def preparar_parametros_optimizacion(
         masa_vehiculo, F_aero, F_roll, eta_total: Vehiculo
         p_media_aux_w, dt_sim, P_bat_input: Simulacion
         cl, area, dist_peso: Dinámica
+        temp_amb, refrigeracion, peso_celda_g: Térmicos
         activar_limite_motor, p_motor_max_kw: Extra
     
     Returns:
@@ -187,5 +232,8 @@ def preparar_parametros_optimizacion(
         'dist_peso': dist_peso,
         'P_regen_vector': P_bat_input,
         'activar_limite_motor': activar_limite_motor,
-        'p_motor_max_kw': p_motor_max_kw
+        'p_motor_max_kw': p_motor_max_kw,
+        'temp_amb': temp_amb,
+        'refrigeracion': refrigeracion,
+        'peso_celda_g': peso_celda_g
     }

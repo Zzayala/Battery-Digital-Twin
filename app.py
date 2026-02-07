@@ -60,11 +60,17 @@ aplicar_estilos_globales()
 # Inicializar Session State
 inicializar_session_state()
 
+# VERIFICACIÓN DE ACTUALIZACIONES DIFERIDAS (Fix StreamlitAPIException)
+if 'pending_acc_update' in st.session_state:
+    st.session_state.slider_acc = st.session_state.pending_acc_update
+    del st.session_state.pending_acc_update
+
 # Recuparación preventiva de estado antes de pintar widgets (para Auto-Ajuste)
-if st.session_state.get('auto_ajuste_pendiente', False):
-    snap_recov = st.session_state.get('snapshot_inputs', {})
-    if 'p_motor_max_kw' in snap_recov:
-         st.session_state.p_motor_max_kw = snap_recov['p_motor_max_kw']
+# ELIMINADO: Lógica de snapshot antigua que causaba conflictos con inputs del usuario.
+# if st.session_state.get('auto_ajuste_pendiente', False):
+#     snap_recov = st.session_state.get('snapshot_inputs', {})
+#     if 'p_motor_max_kw' in snap_recov:
+#          st.session_state.p_motor_max_kw = snap_recov['p_motor_max_kw']
 
 # Constantes rápidas
 CV = CONSTANTES_VEHICULO
@@ -156,9 +162,9 @@ def aplicar_config_pack():
         
         save_last_config(nombre_pack) # PERSISTENCIA
         
-        # === AUTO-AJUSTE AUTOMÁTICO AL CARGAR PACK ===
-        st.session_state.auto_ajuste_pendiente = True
-        st.toast("🎯 Ejecutando auto-ajuste...", icon="⚙️")
+        # === AUTO-AJUSTE AUTOMÁTICO ELIMINADO ===
+        # st.session_state.auto_ajuste_pendiente = True
+
 
 
 
@@ -189,8 +195,8 @@ def actualizar_celda_pack():
         guardar_db_modelos(st.session_state.db_models)
 
 def activar_auto_ajuste():
-    """Callback simple: Marca que se debe recalcular el umbral."""
-    st.session_state.auto_ajuste_pendiente = True
+    """Callback simple: No hace nada (Desactivado)."""
+    pass
 
 def eliminar_pack_seleccionado():
     """Callback: Marca pack para eliminación."""
@@ -308,15 +314,7 @@ with st.sidebar:
     with st.expander("🎯 Estrategia de Consumo", expanded=False):
         st.caption("Umbral de activación de tracción eléctrica")
         
-        # Aplicar resultado de auto-ajuste pendiente (si existe de un rerun anterior)
-        if 'auto_ajuste_resultado_pendiente' in st.session_state:
-            st.session_state.slider_acc = st.session_state.auto_ajuste_resultado_pendiente
-            del st.session_state.auto_ajuste_resultado_pendiente
-        
-        # Aplicar resultado de auto-ajuste pendiente antiguo (retrocompatibilidad)
-        if 'auto_ajuste_resultado' in st.session_state:
-            st.session_state.slider_acc = st.session_state.auto_ajuste_resultado
-            del st.session_state.auto_ajuste_resultado
+
         
         # Botones de ajuste fino
         col_minus, col_valor, col_plus = st.columns([1, 2, 1])
@@ -333,29 +331,40 @@ with st.sidebar:
             min_value=0.0, max_value=13.0, step=0.01,
             format="%.2f", key="slider_acc"
         )
-        if st.session_state.get('flag_auto_ajuste_completado', False):
-             st.success(f"✅ Ajustado a {st.session_state.slider_acc:.2f} m/s²")
-             del st.session_state.flag_auto_ajuste_completado
+
 
         acc_umbral = st.session_state.slider_acc
         
+        # Botón de Auto-Ajuste (One-Shot)
+        if st.button("🪄 Auto-Ajustar Umbral", help="Calcula el valor ideal para agotar la batería llegando al SOC mínimo + 1%"):
+            st.session_state.ejecutar_auto_ajuste = True
+
+        # === RAYOS X: DEBUG DE OPTIMIZACIÓN (EN SIDEBAR) ===
+        if 'last_opt_logs' in st.session_state and st.session_state.last_opt_logs:
+            logs = st.session_state.last_opt_logs
+            df_logs = pd.DataFrame(logs)
+            csv = df_logs.to_csv(index=False).encode('utf-8')
+
+            st.download_button(
+                label="📄 Descargar Rayos X (CSV)",
+                data=csv,
+                file_name='debug_auto_ajuste.csv',
+                mime='text/csv',
+                key='download_debug_csv',
+                help="Descarga el historial de iteraciones del último auto-ajuste realizado."
+            )
+
         # === MODO ADAPTATIVO ===
         st.markdown("---")
         modo_adaptativo = st.toggle("🔄 Modo Adaptativo", value=False, key="modo_adaptativo",
                                      help="Ajusta el umbral automáticamente durante la carrera para llegar exactamente al SOC mínimo")
         
         if modo_adaptativo:
-            st.success("✅ El umbral se ajustará cada 50m para optimizar el consumo en tiempo real")
-            intervalo_adaptacion = st.slider("Intervalo de adaptación (m)", 25, 200, 50, 25, key="intervalo_adaptacion")
+            st.success("✅ El umbral se ajustará continuamente para optimizar el consumo")
             margen_soc_objetivo = st.slider("Margen sobre SOC mínimo (%)", 0.0, 5.0, 0.5, 0.1, key="margen_soc_objetivo")
         else:
-            intervalo_adaptacion = 50
             margen_soc_objetivo = 0.5
-            # Botón Auto-Ajuste (solo en modo fijo)
-            if st.button("🎯 Auto-Ajustar Umbral Inicial", key="auto_ajuste", use_container_width=True):
-                activar_auto_ajuste()
-                st.rerun()
-            st.caption("Calcula el umbral fijo óptimo para toda la carrera")
+
         
         st.info(f"💡 Umbral inicial = {acc_umbral:.2f} m/s²" + (" (se adaptará)" if modo_adaptativo else " (fijo)"))
 
@@ -626,52 +635,66 @@ if t_telem is not None and len(t_telem) > 1:
         f_ocv_user, eta_total, cap_celda_sim
     )
     
-    # === AUTO-AJUSTE ===
-    # === AUTO-AJUSTE SIMPLE ===
-    if st.session_state.get('auto_ajuste_pendiente', False):
-        st.session_state.auto_ajuste_pendiente = False
-        
-        with st.spinner("🎯 Buscando umbral óptimo..."):
-            dt_sim = t_telem[1] - t_telem[0] if len(t_telem) > 1 else 0.1
-            
-            # Recopilar parámetros directamente del entorno vivo
-            params_opt = preparar_parametros_optimizacion(
-                cap_celda=cap_celda_sim,        # Ya incluye degradación SOH
-                r_interna_mohm=r_interna_sim,   # Ya incluye degradación SOH
-                n_s=st.session_state.pack_ns, 
-                n_p=st.session_state.pack_np, 
-                soc_max=st.session_state.pack_soc_max,
-                i_descarga_cont=i_descarga_cont_sim, 
-                i_descarga_pico=i_descarga_pico_sim,
-                t_descarga_pico=t_descarga_pico,
-                v_nom_celda=v_nom_celda, 
-                v_max_celda=v_max_celda, 
-                v_min_celda=v_min_celda,
-                masa_vehiculo=masa_vehiculo, 
-                F_aero=F_aero, F_roll=F_roll, eta_total=eta_total,
-                p_media_aux_w=p_media_aux_w, 
-                dt_sim=dt_sim, 
-                P_bat_input=P_bat_input,
-                cl=cl_downforce, 
-                area=area_frontal, 
-                dist_peso=dist_peso_front,
-                activar_limite_motor=st.session_state.get('activar_limite_motor', True),
-                p_motor_max_kw=st.session_state.get('p_motor_max_kw', 10.0)
-            )
-            
-            # Buscar el nuevo umbral
-            umbral_opt, soc_final_opt, log_opt = buscar_umbral_optimo(
-                st.session_state.pack_soc_min, # Objetivo: SOC Mínimo config
-                acc_telem, v_ms, n_vueltas, params_opt
-            )
-            
-            # Aplicar resultado y notificar
-            st.session_state.auto_ajuste_resultado_pendiente = round(umbral_opt, 2)
-            st.session_state.flag_auto_ajuste_completado = True
-            st.rerun() # Refrescar UI con nuevo valor
+    # === AUTO-AJUSTE ELIMINADO ===
 
     # Perfil de potencia
     dt_telem = t_telem[1] - t_telem[0] if len(t_telem) > 1 else 0.1
+
+    # === AUTO-AJUSTE UMBRAL ===
+    if st.session_state.get('ejecutar_auto_ajuste', False):
+        with st.spinner("🔄 Optimizando Umbral..."):
+            # Preparar parámetros
+            params_opt = preparar_parametros_optimizacion(
+                cap_celda=cap_celda_sim,
+                r_interna_mohm=r_interna_sim,
+                n_s=n_s,
+                n_p=n_p,
+                soc_max=soc_max,
+                i_descarga_cont=i_descarga_cont_sim,
+                i_descarga_pico=i_descarga_pico_sim,
+                t_descarga_pico=t_descarga_pico,
+                v_nom_celda=v_nom_celda,
+                v_max_celda=v_max_celda,
+                v_min_celda=v_min_celda,
+                masa_vehiculo=masa_vehiculo,
+                F_aero=F_aero,
+                F_roll=F_roll,
+                eta_total=eta_total,
+                p_media_aux_w=p_media_aux_w,
+                dt_sim=dt_telem,
+                P_bat_input=P_bat_input,
+                cl=cl_downforce,
+                area=area_frontal,
+                dist_peso=dist_peso_front,
+                activar_limite_motor=activar_limite_motor,
+                p_motor_max_kw=p_motor_max_kw,
+
+                # Térmicos
+                temp_amb=temp_amb,
+                refrigeracion=refrigeracion,
+                peso_celda_g=peso_celda_g
+            )
+            
+            # Buscar óptimo
+            umbral_opt, soc_final_opt, logs = buscar_umbral_optimo(
+                soc_minimo=soc_min,
+                acc_telem=acc_telem,
+                v_ms=v_ms,
+                n_vueltas=n_vueltas,
+                params=params_opt
+            )
+            
+            # Aplicar resultado (Diferido para evitar error de widget ya instanciado)
+            st.session_state.pending_acc_update = float(umbral_opt)
+            st.session_state.ejecutar_auto_ajuste = False
+
+            # Guardar logs para Rayos X
+            st.session_state.last_opt_logs = logs
+            st.session_state.last_opt_target = [soc_min + 1.0, soc_min + 2.0]
+
+            st.toast(f"✅ Umbral Calculado: {umbral_opt} m/s² (SOC: {soc_final_opt:.1f}%)", icon="🎯")
+            st.rerun()
+
     MARGEN_TRACCION = 0.90
     
     P_elec_pack = generar_perfil_potencia_unificado(
@@ -687,6 +710,8 @@ if t_telem is not None and len(t_telem) > 1:
         p_motor_max_kw=p_motor_max_kw
     )
     
+
+
     # Límite de grip para visualización
     F_downforce = 0.5 * CV.RHO_AIRE * v_ms**2 * cl_downforce * area_frontal
     Peso_eje_del = masa_vehiculo * CV.G * dist_peso_front
@@ -776,7 +801,6 @@ if t_telem is not None and len(t_telem) > 1:
             temp_amb=temp_amb, refrigeracion=refrigeracion,
             peso_celda_g=peso_celda_g,
             umbral_inicial=acc_umbral,
-            intervalo_adaptacion_m=float(intervalo_adaptacion),
             margen_soc_final=margen_soc_objetivo,
             margen_traccion=MARGEN_TRACCION
         )
@@ -787,6 +811,7 @@ if t_telem is not None and len(t_telem) > 1:
         umbral_full = resultado_sim['umbral_full']
         P_elec_full = resultado_sim['P_elec_full']
         distancia_full = resultado_sim['distancia_full']
+        r_pack_full = resultado_sim.get('r_pack_full', np.zeros_like(t_full))
         umbral_final = resultado_sim['umbral_final']
         
     else:
@@ -812,6 +837,7 @@ if t_telem is not None and len(t_telem) > 1:
         soc_full = resultado_sim['soc_full']
         temps_full = resultado_sim['temps_full']
         umbral_full = resultado_sim['umbral_full']
+        r_pack_full = resultado_sim.get('r_pack_full', np.zeros_like(t_full))
         umbral_final = resultado_sim['umbral_final']
     
     t_max = np.max(temps_full)
@@ -983,7 +1009,37 @@ if t_telem is not None and len(t_telem) > 1:
             ax3.xaxis.set_major_formatter(FuncFormatter(time_formatter))
             
             plt.tight_layout()
+            plt.tight_layout()
             st.pyplot(fig1)
+
+            # --- NUEVO: GRÁFICO DE RESISTENCIA DEL PACK (1 VUELTA) ---
+            st.markdown("---")
+            st.subheader("📊 Resistencia Interna Pack (1 Vuelta)")
+
+            fig_r_lap, ax_r_lap = plt.subplots(figsize=(12, 3))
+
+            # Tomar solo la primera vuelta (la longitud de t_base)
+            n_puntos_vuelta = len(t_base)
+            # Asegurar que r_pack_full tenga datos (si no se corrió simulación, puede estar vacío o ceros)
+            if 'r_pack_full' in locals() and len(r_pack_full) >= n_puntos_vuelta:
+                r_lap_mohm = r_pack_full[:n_puntos_vuelta] * 1000.0
+
+                ax_r_lap.plot(t_base, r_lap_mohm, color='#ff9800', linewidth=1.2)
+                ax_r_lap.fill_between(t_base, r_lap_mohm, alpha=0.2, color='#ff9800')
+
+                # Referencia base
+                r_base_pack_mohm = (r_interna_mohm * n_s / n_p)
+                ax_r_lap.axhline(r_base_pack_mohm, color='white', linestyle='--', alpha=0.5, label='R Base')
+
+                ax_r_lap.legend(loc='upper right', facecolor='#1a1a2e', edgecolor='#444', labelcolor='white')
+
+            ax_r_lap.set_ylabel("Resistencia (mΩ)", color='#ff9800')
+            ax_r_lap.tick_params(axis='y', labelcolor='#ff9800')
+            aplicar_estilo_dark(ax_r_lap, "Dinámica de Impedancia (Vuelta 1)", "Tiempo", "")
+            ax_r_lap.xaxis.set_major_formatter(FuncFormatter(time_formatter))
+
+            plt.tight_layout()
+            st.pyplot(fig_r_lap)
             
             # --- PERFIL AUXILIAR (TAB 1) ---
             st.markdown("---")
@@ -1082,6 +1138,36 @@ if t_telem is not None and len(t_telem) > 1:
 
 
             
+            # === GRÁFICO DE UMBRAL ADAPTATIVO (solo si está activo) ===
+
+            # --- NUEVO: GRÁFICO DE RESISTENCIA DEL PACK ---
+            st.markdown("---")
+            st.subheader("📊 Evolución de Resistencia Interna (Pack)")
+
+            fig_r, ax_r = plt.subplots(figsize=(12, 3))
+
+            # Convertir a mOhms para visualización más clara
+            r_pack_mohm_full = r_pack_full * 1000.0
+
+            ax_r.plot(t_full, r_pack_mohm_full, color='#ff9800', linewidth=1.2)
+            ax_r.fill_between(t_full, r_pack_mohm_full, alpha=0.2, color='#ff9800')
+            ax_r.set_ylabel("Resistencia Pack (mΩ)", color='#ff9800')
+            ax_r.tick_params(axis='y', labelcolor='#ff9800')
+
+            # Línea de referencia base (estática)
+            r_base_pack_mohm = (r_interna_mohm * n_s / n_p)
+            ax_r.axhline(r_base_pack_mohm, color='white', linestyle='--', alpha=0.5, label='R Base (Estática)')
+            ax_r.legend(loc='upper right', facecolor='#1a1a2e', edgecolor='#444', labelcolor='white')
+
+            for v in range(1, n_vueltas):
+                ax_r.axvline(x=v * t_vuelta, color='white', linestyle=':', alpha=0.2)
+
+            aplicar_estilo_dark(ax_r, "Dinámica de Impedancia Interna", "Tiempo", "")
+            ax_r.xaxis.set_major_formatter(FuncFormatter(time_formatter))
+
+            plt.tight_layout()
+            st.pyplot(fig_r)
+
             # === GRÁFICO DE UMBRAL ADAPTATIVO (solo si está activo) ===
             if modo_adaptativo:
                 st.markdown("---")
