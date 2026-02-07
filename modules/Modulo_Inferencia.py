@@ -127,8 +127,21 @@ class CerebroDegradacion:
 
         # 1. Buscar Gemelos (KNN por C-rate)
         # Buscamos experimentos que se hicieran a una velocidad similar
-        self.df['distancia'] = abs(self.df['C_rate'] - c_rate_usuario)
-        vecinos = self.df.sort_values('distancia').head(5)
+        # Optimización: Usamos NumPy directo para evitar overhead de pandas y sorting completo
+        c_rates = self.df['C_rate'].values
+        distancias = np.abs(c_rates - c_rate_usuario)
+
+        # Encontrar los k índices con menor distancia
+        k = 5
+        if len(distancias) > k:
+            # argpartition pone los k menores al principio (sin orden garantizado entre ellos)
+            # Esto es O(n) vs O(n log n) de sort
+            idx = np.argpartition(distancias, k)[:k]
+        else:
+            # Fallback para datasets diminutos
+            idx = np.arange(len(distancias))
+
+        vecinos = self.df.iloc[idx]
 
         # 2. Promediar comportamiento
         deg_cap_base = vecinos['capacity_fade_pct'].mean()
