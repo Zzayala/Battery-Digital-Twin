@@ -107,4 +107,4 @@ The scatter plot below serves as a **Pareto Front** for decision-making:
     * Longitudinal Dynamics for power demand.
 
 ---
-*Author: [Álvaro Ayala Martín]([![LinkedIn](https://www.linkedin.com/in/ayalamartin/))*
+*Author: [Álvaro Ayala Martín] [LinkedIn](https://www.linkedin.com/in/ayalamartin/)*
