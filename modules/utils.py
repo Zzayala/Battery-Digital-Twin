@@ -14,6 +14,7 @@ Funciones:
 import streamlit as st
 import os
 import sys
+import html
 
 
 # =============================================================================
@@ -152,16 +153,22 @@ def mostrar_kpi_html(label, valor, unidad="", color_borde="#007acc"):
         unidad: Unidad de medida (opcional)
         color_borde: Color del borde izquierdo (hex)
     """
+    # Escapar inputs para prevenir XSS
+    label_esc = html.escape(str(label))
+    valor_esc = html.escape(str(valor))
+    unidad_esc = html.escape(str(unidad))
+    color_borde_esc = html.escape(str(color_borde))
+
     html_code = f"""
     <div style="
         background-color: #1e1e1e; 
         padding: 10px; 
         border-radius: 6px; 
-        border-left: 5px solid {color_borde};
+        border-left: 5px solid {color_borde_esc};
         margin-bottom: 10px;">
-        <p style="margin:0; color: #aaa; font-size: 11px; text-transform: uppercase;">{label}</p>
+        <p style="margin:0; color: #aaa; font-size: 11px; text-transform: uppercase;">{label_esc}</p>
         <p style="margin:0; font-size: 20px; font-weight: bold; color: white;">
-            {valor} <span style="font-size: 12px; color: #ccc;">{unidad}</span>
+            {valor_esc} <span style="font-size: 12px; color: #ccc;">{unidad_esc}</span>
         </p>
     </div>
     """
