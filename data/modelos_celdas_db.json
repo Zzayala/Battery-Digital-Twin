@@ -1,26 +1,136 @@
 {
-    "last_used": "Generico 5Ah",
+    "last_used": "GRP7770175 - 10.0 Ah",
     "models": {
-        "Generico 10Ah": {
+        "GRP7770175 - 10.0 Ah": {
             "cap": 10.0,
             "v_nom": 3.7,
             "v_max": 4.2,
-            "v_min": 2.5,
-            "peso": 200.0,
-            "r_int": 1.5,
+            "v_min": 3.0,
+            "peso": 206.0,
+            "r_int": 2.0250000000000004,
+            "ac_imp": 1.5,
             "i_cont": 80.0,
             "i_pico": 300.0,
             "t_pico": 3.0
         },
-        "Generico 5Ah": {
-            "cap": 5.0,
+        "GRP5744120 - 3.1 Ah": {
+            "cap": 3.1,
             "v_nom": 3.7,
             "v_max": 4.2,
-            "v_min": 2.5,
-            "peso": 100.0,
-            "r_int": 1.5,
-            "i_cont": 40.0,
-            "i_pico": 150.0,
+            "v_min": 3.0,
+            "peso": 68.5,
+            "r_int": 2.565,
+            "ac_imp": 1.9,
+            "i_cont": 108.5,
+            "i_pico": 124.0,
+            "t_pico": 3.0
+        },
+        "GRP8043143 - 6.0 Ah": {
+            "cap": 6.0,
+            "v_nom": 3.8,
+            "v_max": 4.35,
+            "v_min": 3.0,
+            "peso": 109.0,
+            "r_int": 3.375,
+            "ac_imp": 2.5,
+            "i_cont": 90.0,
+            "i_pico": 120.0,
+            "t_pico": 3.0
+        },
+        "GRP8142126 - 4.3Ah": {
+            "cap": 4.3,
+            "v_nom": 3.7,
+            "v_max": 4.2,
+            "v_min": 3.0,
+            "peso": 96.0,
+            "r_int": 2.16,
+            "ac_imp": 1.6,
+            "i_cont": 120.0,
+            "i_pico": 172.0,
+            "t_pico": 3.0
+        },
+        "GRP8143084 - 4.2 Ah": {
+            "cap": 4.2,
+            "v_nom": 3.8,
+            "v_max": 4.35,
+            "v_min": 3.0,
+            "peso": 66.5,
+            "r_int": 2.7,
+            "ac_imp": 2.0,
+            "i_cont": 20.0,
+            "i_pico": 84.0,
+            "t_pico": 3.0
+        },
+        "GRP7662108 - 7.55\tAh": {
+            "cap": 7.55,
+            "v_nom": 3.85,
+            "v_max": 4.4,
+            "v_min": 3.0,
+            "peso": 113.0,
+            "r_int": 3.24,
+            "ac_imp": 2.4,
+            "i_cont": 22.6,
+            "i_pico": 37.75,
+            "t_pico": 3.0
+        },
+        "GRP8643084 - 4.8 Ah": {
+            "cap": 4.8,
+            "v_nom": 3.8,
+            "v_max": 4.35,
+            "v_min": 3.0,
+            "peso": 73.5,
+            "r_int": 2.295,
+            "ac_imp": 1.7,
+            "i_cont": 60.0,
+            "i_pico": 96.0,
+            "t_pico": 3.0
+        },
+        "GRP8736108 - 5.0 Ah": {
+            "cap": 5.0,
+            "v_nom": 3.85,
+            "v_max": 4.2,
+            "v_min": 3.0,
+            "peso": 75.0,
+            "r_int": 4.59,
+            "ac_imp": 3.4,
+            "i_cont": 15.0,
+            "i_pico": 25.0,
+            "t_pico": 3.0
+        },
+        "GRP8770170 - 17,0 Ah": {
+            "cap": 17.0,
+            "v_nom": 3.7,
+            "v_max": 4.2,
+            "v_min": 3.0,
+            "peso": 217.0,
+            "r_int": 3.375,
+            "ac_imp": 2.5,
+            "i_cont": 34.0,
+            "i_pico": 170.0,
+            "t_pico": 15.0
+        },
+        "GRP9138088 - 4.2 Ah": {
+            "cap": 4.2,
+            "v_nom": 3.7,
+            "v_max": 4.2,
+            "v_min": 3.0,
+            "peso": 64.0,
+            "r_int": 6.48,
+            "ac_imp": 4.8,
+            "i_cont": 33.6,
+            "i_pico": 42.0,
+            "t_pico": 3.0
+        },
+        "GRP9840121 - 7.2 Ah": {
+            "cap": 7.2,
+            "v_nom": 3.7,
+            "v_max": 4.2,
+            "v_min": 3.0,
+            "peso": 103.0,
+            "r_int": 4.32,
+            "ac_imp": 3.2,
+            "i_cont": 21.6,
+            "i_pico": 72.0,
             "t_pico": 3.0
         }
     }
