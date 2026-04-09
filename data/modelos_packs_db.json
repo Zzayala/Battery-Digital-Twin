@@ -1,18 +1,81 @@
 {
     "packs": {
-        "14S1P_100-0": {
-            "modelo_celda": "Generico 10Ah",
+        "14S3P": {
+            "modelo_celda": "GRP5744120 - 3.1 Ah",
             "ns": 14,
-            "np": 1,
+            "np": 3,
             "soc_max": 100,
-            "soc_min": 0
+            "soc_min": 5
         },
-        "14S2P100-0": {
-            "modelo_celda": "Generico 5Ah",
+        "13S2P": {
+            "modelo_celda": "GRP8043143 - 6.0 Ah",
+            "ns": 13,
+            "np": 2,
+            "soc_max": 100,
+            "soc_min": 5
+        },
+        "14S2P": {
+            "modelo_celda": "GRP8142126 - 4.3Ah",
             "ns": 14,
             "np": 2,
             "soc_max": 100,
-            "soc_min": 0
+            "soc_min": 5
+        },
+        "13S1P": {
+            "modelo_celda": "GRP8770170 - 17,0 Ah",
+            "ns": 13,
+            "np": 1,
+            "soc_max": 100,
+            "soc_min": 5
+        },
+        "13S2P 7,55 Ah": {
+            "modelo_celda": "GRP7662108 - 7.55\tAh",
+            "ns": 13,
+            "np": 2,
+            "soc_max": 100,
+            "soc_min": 5
+        },
+        "13S2P 4,80 Ah": {
+            "modelo_celda": "GRP8643084 - 4.8 Ah",
+            "ns": 13,
+            "np": 3,
+            "soc_max": 100,
+            "soc_min": 5
+        },
+        "13S3P 5,0 Ah": {
+            "modelo_celda": "GRP8736108 - 5.0 Ah",
+            "ns": 13,
+            "np": 3,
+            "soc_max": 100,
+            "soc_min": 5
+        },
+        "14S1P 10Ah": {
+            "modelo_celda": "GRP7770175 - 10.0 Ah",
+            "ns": 14,
+            "np": 1,
+            "soc_max": 100,
+            "soc_min": 5
+        },
+        "14S1P 7,2 Ah": {
+            "modelo_celda": "GRP9840121 - 7.2 Ah",
+            "ns": 14,
+            "np": 2,
+            "soc_max": 100,
+            "soc_min": 5
+        },
+        "14S3P - 4,2 Ah": {
+            "modelo_celda": "GRP8143084 - 4.2 Ah",
+            "ns": 14,
+            "np": 3,
+            "soc_max": 100,
+            "soc_min": 5
+        },
+        "14S3P - 4,20 Ah": {
+            "modelo_celda": "GRP9138088 - 4.2 Ah",
+            "ns": 14,
+            "np": 3,
+            "soc_max": 100,
+            "soc_min": 5
         }
     }
 }

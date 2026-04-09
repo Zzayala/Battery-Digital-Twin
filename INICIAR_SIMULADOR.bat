@@ -1,0 +1,6 @@
+@echo off
+TITLE Bateria Lab - Iniciando...
+cd /d "C:\Temp_Analisis\Bateria_Lab_Project"
+echo Iniciando el Simulador...
+python -m streamlit run app.py
+pause

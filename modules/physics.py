@@ -696,7 +696,7 @@ def calcular_dinamica_vehiculo(v_ms, acc_m2, masa_kg, cd=0.40, area_frontal=1.24
 
 def calcular_factores_degradacion(
     I_cell_array, cap_celda, temps_full, soc_max, soc_min,
-    cerebro_ia=None, factor_dano_regen=4.0, factor_pouch=2.0
+    cerebro_ia=None, factor_dano_regen=4.0, factor_pouch=1.5
 ):
     """
     Calcula los factores de degradación de la batería usando modelos físicos.
